@@ -1,0 +1,51 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcpeek"
+dynamic = ["version"]
+description = "Read-only, offline forensic CLI that reconstructs MCP tool-call activity from Claude Code CLI artifacts"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Jan-Niclas Hilgert" },
+    { name = "Michael Külper" },
+    { name = "Martin Lambertz" },
+    { name = "Jan Gruber" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Topic :: Security",
+    "Environment :: Console",
+]
+dependencies = [
+    "click>=8.1",
+    "rich>=13.7",
+    "pydantic>=2.6",
+    "pyyaml>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/fkie-cad/mcpeek"
+Repository = "https://github.com/fkie-cad/mcpeek"
+Issues = "https://github.com/fkie-cad/mcpeek/issues"
+
+[project.scripts]
+mcpeek = "mcpeek.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "mcpeek.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["mcpeek*"]
+
+[tool.setuptools.package-data]
+mcpeek = ["data/*.yml"]

@@ -1,0 +1,196 @@
+# MCPeek artifact manifest for the Claude Code CLI (DFA/ForensicArtifacts-style).
+#
+# This file drives mcpeek.loader.TargetLoader's discovery -- it is not
+# decorative. Every path below is relative to the --target root, which is
+# expected to look like a user's HOME directory: it contains ".claude.json"
+# directly, and a ".claude/" subdirectory with everything else.
+#
+# Paths are deliberately scoped (no unbounded "**" globs). In particular we
+# do NOT recursively glob for ".mcp.json": plugin marketplace
+# trees (.claude/plugins/marketplaces/**/.mcp.json) contain thousands of
+# unrelated manifests bundled with third-party plugins, and a recursive glob
+# would flood the servers view with noise. Project-local ".mcp.json" /
+# ".claude/settings.local.json" are only ever looked up at literal project
+# roots: the project paths in .claude.json's projects map and the transcript
+# cwd values, mapped below HOME of the examined host (--home, or inferred)
+# into the target root -- see loader.py.
+version: 1
+artifacts:
+  - id: user_config
+    kind: file
+    path: ".claude.json"
+    description: >
+      Primary Claude Code user configuration: per-project mcpServers
+      (a remote server entry can carry an "oauth" object: clientId,
+      callbackPort, authServerMetadataUrl, scopes), oauthAccount identity,
+      global mcpServers (usually empty), and per-project bookkeeping
+      (lastSessionId, allowedTools, ...).
+
+  - id: config_backups
+    kind: glob
+    path: ".claude/backups"
+    glob: ".claude.json.backup.*"
+    description: >
+      A small FIFO of prior full .claude.json snapshots. Each one carries
+      the same identity fields as the primary file. May reveal a removed
+      server or a plaintext env secret that no longer appears in the
+      current config.
+
+  - id: credentials
+    kind: file
+    path: ".claude/.credentials.json"
+    description: >
+      claudeAiOauth (the CLI's own login) and mcpOAuth (per-MCP-server
+      OAuth client registrations: DCR opaque client ids or CIMD hosted
+      metadata-document URLs, plus discoveryState and token presence).
+
+  - id: user_grants
+    kind: file
+    path: ".claude/settings.local.json"
+    description: >
+      User-scope permission grants (permissions.allow), keyed by tool name
+      only -- no schema or hash, so a later tool-description change is
+      invisible to the grant.
+
+  - id: project_grants
+    kind: project_scoped_file
+    relative_path: ".claude/settings.local.json"
+    description: >
+      Project-scope permission grants, one file per project path (from
+      .claude.json's "projects" map and transcript cwd values). The path is
+      mapped into the target root relative to HOME of the examined host
+      (/root/pi -> <target>/pi for HOME /root). A project path outside HOME,
+      e.g. /tmp/..., is not part of the target and is reported as a warning.
+      For a project at HOME itself the file is the user-scope
+      .claude/settings.local.json, listed once with both scopes.
+
+  - id: project_mcp_manifest
+    kind: project_scoped_file
+    relative_path: ".mcp.json"
+    description: >
+      Optional project-local MCP server manifest. Looked up ONLY at the
+      literal project root (never recursively), mapped like project_grants.
+      Servers added with "claude mcp add" are stored in .claude.json's
+      projects.<cwd>.mcpServers instead, so an empty result here is
+      common.
+    exclude_path_contains: ["plugins/marketplaces"]
+
+  - id: sessions
+    kind: session_tree
+    path: ".claude/projects"
+    description: >
+      One directory per encoded project path, each holding session
+      transcripts. Two on-disk shapes exist for the same session and are
+      companions, not alternatives: a flat "<uuid>.jsonl" file, and
+      (when subagents or spilled output exist) a same-named "<uuid>/"
+      directory next to it holding "subagents/" and/or "tool-results/".
+      The session id is the "sessionId" of the records (MCP logs and
+      --debug files are named after it); the file name normally equals it
+      but a copied or renamed file can differ, and the companion directory
+      is found by the file name.
+
+  - id: subagent_sidecars
+    kind: nested_glob
+    under: sessions
+    relative_glob: "*/subagents/agent-*.jsonl"
+    description: >
+      Delegated sub-agent transcripts, isSidechain:true. A depth-2
+      subagent's own spawn call lives inside its depth-1 parent's
+      sidecar, so linking must recurse rather than scanning the main
+      transcript once.
+
+  - id: subagent_meta
+    kind: nested_glob
+    under: sessions
+    relative_glob: "*/subagents/agent-*.meta.json"
+    description: >
+      {agentType, description, toolUseId, spawnDepth, [parentAgentId]}.
+      agentId is NOT a field in this file -- derive it from the filename
+      ("agent-<agentId>.meta.json") or from the agentId field present on
+      records inside the paired .jsonl sidecar.
+
+  - id: spilled_tool_results
+    kind: nested_glob
+    under: sessions
+    relative_glob: "*/tool-results/*.txt"
+    description: >
+      Oversized tool output written verbatim when a result exceeds the
+      inline token budget. The result is replaced by a stub that starts
+      "Error: result (N characters) exceeds maximum allowed tokens. Output
+      has been saved to <path>." (MCP tools) or "<persisted-output> Output
+      too large (N). Full output saved to: <path>" (other tools); only that
+      stub is a spill reference (a Read of a tool-results file is not).
+      The stub embeds an absolute path like
+      "/root/.claude/projects/<enc>/<uuid>/tool-results/<file>"; resolve
+      only the "tool-results/<file>" tail against the session's own
+      directory, never the literal absolute path.
+
+  - id: debug_logs
+    kind: glob
+    path: ".claude/debug"
+    glob: "*.txt"
+    description: >
+      --debug session files "<sessionId>.txt" (plus "<sessionId>.1.txt"
+      after a 10 MiB rotation, and "sdk-<uuid>.txt" written by an Agent SDK
+      host). Written only in debug mode, which is wider than --debug: also
+      -d, --debug=<filter>, --debug-file <path> (any location; pass it with
+      MCPeek's --debug-file), env DEBUG or DEBUG_SDK set to 1/true/yes/on,
+      and the interactive /debug command (from that moment on). The folder
+      follows CLAUDE_CONFIG_DIR. The file name is the session id at write
+      time: --continue/--resume write start-up lines to an orphan file and
+      append the rest to the resumed session's file; /clear switches to a
+      new file. Lines are "<ISO> [LEVEL] <message>" with header-less
+      continuation lines; under --output-format json|stream-json multi-line
+      messages are JSON-encoded. Every MCP-log record is mirrored as
+      'MCP server "<raw name>": <msg>' (DEBUG) or 'MCP server "<raw name>"
+      <msg>' (ERROR), 0-5 ms earlier, with keyword-based [REDACTED] masking.
+      The capabilities JSON has hasTools..serverVersion (runtime arm v1) and
+      additionally protocolEra/negotiatedProtocolVersion (arm v2);
+      serverVersion can be the string "unknown". "[Stall]
+      tool_dispatch_start ... toolUseId=<id>" lines carry the tool-use id
+      that the MCP log lacks. Retention deletes files by mtime older than
+      cleanupPeriodDays (default 30). See docs/log-formats.md.
+
+  - id: debug_latest
+    kind: symlink
+    path: ".claude/debug/latest"
+    description: >
+      Symlink replaced by each debug-enabled process on its first write,
+      pointing (absolute path) at that process's first debug file; not
+      updated on a session switch, skipped by retention (can dangle).
+      MCPeek reports the link text and never follows it. A regular-file
+      copy (as produced by some acquisition tools) is compared byte-wise
+      with the other debug files and parsed only if it differs.
+
+  - id: mcp_logs
+    kind: mcp_log_tree
+    description: >
+      Per-server MCP logs, "<cacheRoot>/claude-cli-nodejs/<enc(cwd)>/
+      mcp-logs-<enc(server)>/<process start, ISO with : and . as ->.jsonl",
+      enc(s) = s.replace(/[^a-zA-Z0-9]/g, "-") (names that sanitize alike
+      share one file). Written by every CLI process that connects or tries
+      to connect a server (headless, interactive, mcp list/get), with or
+      without --debug; no setting disables it. Records:
+      {"debug"|"error": msg, "timestamp", "sessionId", "cwd"}. Buffered
+      (1 s / 50 records): a SIGKILL loses the tail or the whole file.
+      Retention deletes files whose file-name date is older than
+      cleanupPeriodDays, only in the cwd the CLI runs in. Connect-time
+      stderr, HTTP header values other than *authorization, URL query
+      tokens, tool error text and elicitation answers are kept in clear.
+      Not moved by CLAUDE_CONFIG_DIR; moved by XDG_CACHE_HOME on Linux
+      (pass the relocated folder with MCPeek's --cache-dir). See
+      docs/log-formats.md.
+    scan_depth: 2  # also look for <target>/claude-cli-nodejs and <target>/*/claude-cli-nodejs
+    locations:
+      - path: ".cache/claude-cli-nodejs"
+        origin: linux-default
+        status: observed
+        note: "${XDG_CACHE_HOME:-~/.cache}/claude-cli-nodejs"
+      - path: "Library/Caches/claude-cli-nodejs"
+        origin: macos-default
+        status: static
+        note: "from the 2.1.226 bundle, not observed"
+      - path: "AppData/Local/claude-cli-nodejs/Cache"
+        origin: windows-default
+        status: static
+        note: "%LOCALAPPDATA%\\claude-cli-nodejs\\Cache, from the 2.1.226 bundle, not observed"

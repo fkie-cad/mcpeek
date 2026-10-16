@@ -1,0 +1,17 @@
+# Virtual environments
+.venv/
+.venv*/
+venv/
+env/
+
+# Byte-compiled files and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Packaging and build output
+*.egg-info/
+build/
+dist/

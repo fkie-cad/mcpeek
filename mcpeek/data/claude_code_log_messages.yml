@@ -1,0 +1,353 @@
+# Message catalog for the Claude Code CLI 2.1.226 per-server MCP log and the
+# MCP-relevant lines of the --debug session file. See docs/log-formats.md.
+#
+# This file drives mcpeek.logcatalog -- it is not decorative.
+#
+# Each mcp_log_messages entry:
+#   id        stable identifier, used in MCPeek output
+#   key       record key in the MCP log: debug | error | any
+#   category  coarse grouping used by the views
+#   status    observed (seen in files written by 2.1.226) or static (taken
+#             from the 2.1.226 bundle, not observed on disk)
+#   pattern   Python regex on the decoded message (named groups are
+#             extracted as fields); matched with re.match, so anchor the end
+#   mask      optional: how sensitive parts are withheld on output
+#             (stderr, tool_error, error_text, error_stack, transport_options,
+#              env, elicitation_request, elicitation_response, channel_message,
+#              config_headers, server_output, permission_rules). URLs in any
+#              message are always handled. error_text withholds the "message"
+#              group (free error text), error_stack everything after the
+#              error name.
+#   fixed_text  optional, true: the template holds only fixed text and names.
+#             An error-level record of a template without mask and without
+#             fixed_text is withheld as a whole.
+#
+# The same entries classify the text of debug-file mirror lines
+# ('MCP server "<name>": <text>' / 'MCP server "<name>" <text>').
+# Messages that match no entry are kept, reported as "unclassified" and
+# their text is withheld as a whole.
+version: 1
+cli_version: "2.1.226"
+
+mcp_log_messages:
+  # --- connection lifecycle -------------------------------------------------
+  - {id: conn.start, key: debug, category: connection, status: observed,
+     pattern: '^Starting connection with timeout of (?P<timeout_ms>\d+)ms$'}
+  - {id: conn.stderr, key: error, category: stderr, status: observed, mask: stderr,
+     pattern: '^Server stderr: (?P<stderr>[\s\S]*)$'}
+  - {id: conn.probe_stderr, key: debug, category: stderr, status: static, mask: stderr,
+     pattern: '^Probe-closed server stderr: (?P<stderr>[\s\S]*)$'}
+  - {id: conn.probe_closed, key: debug, category: connection, status: static,
+     pattern: '^version negotiation probe closed the stdio server[\s\S]*$'}
+  - {id: conn.probe_failed, key: debug, category: connection, status: static,
+     pattern: '^version negotiation probe failed on the (?P<transport>\S+) transport; reconnecting pinned legacy$'}
+  - {id: conn.ok, key: debug, category: connection, status: observed,
+     pattern: '^Successfully connected \(transport: (?P<transport>[^)]+)\) in (?P<connect_ms>\d+)ms$'}
+  - {id: conn.caps, key: debug, category: capabilities, status: observed,
+     pattern: '^Connection established with capabilities: (?P<json>\{[\s\S]*\})$'}
+  - {id: conn.fail, key: debug, category: connection, status: observed, mask: error_text,
+     pattern: '^Connection failed after (?P<elapsed_ms>\d+)ms(?: \((?P<code>[^)]*)\))?: (?P<message>[\s\S]*)$'}
+  - {id: conn.fail_error, key: error, category: connection, status: observed, mask: error_text,
+     pattern: '^Connection failed(?: \((?P<code>[^)]*)\))?: (?P<message>[\s\S]*)$'}
+  - {id: conn.error_stack, key: error, category: connection, status: observed, mask: error_stack,
+     pattern: '^(?P<error_name>[A-Za-z]*Error)(?:: (?P<message>[^\n]*))?\n\s+at [\s\S]*$'}
+  # An Error object: the debug-file copy has "Name: message" only (no stack).
+  # In the MCP log this form is expected only for errors without a stack.
+  - {id: conn.error_object, key: error, category: connection, status: observed, mask: error_text,
+     pattern: '^(?P<error_name>[A-Za-z]*Error): (?P<message>[^\n]*)$'}
+  - {id: conn.timeout, key: debug, category: connection, status: static,
+     pattern: '^Connection timeout triggered after (?P<elapsed_ms>\d+)ms \(limit: (?P<limit_ms>\d+)ms\)$'}
+  - {id: conn.retry_transient, key: debug, category: connection, status: observed,
+     pattern: '^Transient (?P<code>\S+) on initial connect \S retry (?P<attempt>\d+)/(?P<max_attempts>\d+) in (?P<delay_ms>\d+)ms$'}
+  - {id: conn.retry_threw, key: error, category: connection, status: static, mask: error_text,
+     pattern: '^Initial-connect retry (?P<attempt>\d+) threw: (?P<message>[\s\S]*)$'}
+  - {id: conn.skipped, key: debug, category: connection, status: static,
+     pattern: '^Skipping connection \((?P<reason>[^)]*)\)$'}
+  - {id: conn.config_invalid, key: any, category: connection, status: static,
+     pattern: '^(?:''url'' is not a valid URL\.[\s\S]*|No URL configured for this server)$'}
+  - {id: conn.stdout_nonjson, key: error, category: connection, status: static, mask: server_output,
+     pattern: '^Ignoring non-JSON line on stdout: (?P<detail>[\s\S]*)$'}
+  - {id: conn.overflow, key: error, category: connection, status: static,
+     pattern: '^(?:wrote >\d+MB to stdout without a JSON-RPC message boundary|streamed >\d+MB without an SSE event boundary)\.[\s\S]*$'}
+  - {id: conn.auth_required, key: debug, category: connection, status: static,
+     pattern: '^Authentication required for (?P<transport>[\s\S]+) server$'}
+  - {id: conn.instructions_truncated, key: debug, category: connection, status: static,
+     pattern: '^Server instructions truncated from (?P<from_chars>\d+) to (?P<to_chars>\d+) chars$'}
+  - {id: conn.inprocess, key: debug, category: connection, status: static,
+     pattern: '^In-process (?P<what>Chrome|Computer Use) MCP server started$'}
+  - {id: conn.misc_error, key: error, category: connection, status: static, mask: error_text,
+     pattern: '^(?:Failed to connect SDK MCP server|connected-client wiring failed[^:]*|MCP connect failed on mount|Failed to initialize servers as pending|Failed to send ide_connected notification): (?P<message>[\s\S]*)$'}
+
+  # --- channels (interactive TUI) --------------------------------------------
+  - {id: chan.skipped, key: debug, category: channel, status: observed,
+     pattern: '^Channel notifications skipped: (?P<reason>[\s\S]*)$'}
+  - {id: chan.registered, key: debug, category: channel, status: static,
+     pattern: '^Channel notifications (?:re-)?registered(?: after reconnect)?$'}
+  - {id: chan.gate, key: debug, category: channel, status: static,
+     pattern: '^Channel gate says skip:(?P<kind>\S+) but was previously registered[\s\S]*$'}
+  - {id: chan.permission, key: debug, category: channel, status: static,
+     pattern: '^notifications/claude/channel/permission: (?P<detail>[\s\S]*)$'}
+  - {id: chan.message, key: debug, category: channel, status: static, mask: channel_message,
+     pattern: '^notifications/claude/channel: (?P<content>[\s\S]*)$'}
+
+  # --- HTTP / SSE / WebSocket / claude.ai proxy transports -------------------
+  - {id: http.init, key: debug, category: transport, status: observed,
+     pattern: '^Initializing HTTP transport to (?P<url>\S+)$'}
+  - {id: http.node, key: debug, category: transport, status: observed,
+     pattern: '^Node version: (?P<node_version>\S+), Platform: (?P<platform>\S+)$'}
+  - {id: http.env, key: debug, category: transport, status: observed, mask: env,
+     pattern: '^Environment: (?P<json>\{[\s\S]*\})$'}
+  - {id: http.options, key: debug, category: transport, status: observed, mask: transport_options,
+     pattern: '^HTTP transport options: (?P<json>\{[\s\S]*\})$'}
+  - {id: http.created, key: debug, category: transport, status: observed,
+     pattern: '^HTTP transport created successfully$'}
+  - {id: http.client_created, key: debug, category: transport, status: observed,
+     pattern: '^Client created, setting up request handler$'}
+  - {id: http.testing, key: debug, category: transport, status: observed,
+     pattern: '^Testing basic HTTP connectivity to (?P<url>\S+)$'}
+  - {id: http.parsed, key: debug, category: transport, status: observed,
+     pattern: '^Parsed URL: host=(?P<host>[^,]*), port=(?P<port>[^,]*), protocol=(?P<protocol>\S+)$'}
+  - {id: http.loopback, key: debug, category: transport, status: observed,
+     pattern: '^Using loopback address: (?P<host>\S+)$'}
+  - {id: http.bad_url, key: debug, category: transport, status: static, mask: error_text,
+     pattern: '^Failed to parse URL: (?P<message>[\s\S]*)$'}
+  - {id: http.fail, key: debug, category: connection, status: observed, mask: error_text,
+     pattern: '^HTTP Connection failed after (?P<elapsed_ms>\d+)ms: (?P<message>[\s\S]*) \(code: (?P<code>[^,]*), errno: (?P<errno>[^)]*)\)$'}
+  - {id: sse.init, key: debug, category: transport, status: static,
+     pattern: '^SSE transport initialized, awaiting connection$'}
+  - {id: sse.ide, key: debug, category: transport, status: static,
+     pattern: '^Setting up SSE-IDE transport to (?P<url>\S+)$'}
+  - {id: sse.fail, key: debug, category: connection, status: static, mask: error_text,
+     pattern: '^SSE Connection failed after (?P<elapsed_ms>\d+)ms: (?P<message>[\s\S]*)$'}
+  - {id: ws.init, key: debug, category: transport, status: static,
+     pattern: '^Initializing WebSocket transport to (?P<url>\S+)$'}
+  - {id: ws.options, key: debug, category: transport, status: static, mask: transport_options,
+     pattern: '^WebSocket transport options: (?P<json>\{[\s\S]*\})$'}
+  - {id: proxy.init, key: debug, category: transport, status: observed,
+     pattern: '^Initializing claude\.ai proxy transport for server (?P<connector_id>\S+)$'}
+  - {id: proxy.using, key: debug, category: transport, status: observed,
+     pattern: '^Using claude\.ai proxy at (?P<url>\S+)$'}
+  - {id: proxy.created, key: debug, category: transport, status: observed,
+     pattern: '^claude\.ai proxy transport created successfully$'}
+  - {id: proxy.fail, key: debug, category: connection, status: observed, mask: error_text,
+     pattern: '^claude\.ai proxy connection failed after (?P<elapsed_ms>\d+)ms: (?P<message>[\s\S]*)$'}
+  - {id: proxy.stateless, key: debug, category: transport, status: static,
+     pattern: '^Stateless claudeai-proxy [\s\S]*$'}
+  - {id: proxy.needs_auth, key: debug, category: transport, status: static,
+     pattern: '^tools/list 401/403 on claude\.ai proxy[\s\S]*$'}
+  - {id: headers.helper, key: any, category: transport, status: static, mask: error_text,
+     pattern: '^(?:Executing headersHelper to get dynamic headers|Successfully retrieved (?P<header_count>\d+) headers from headersHelper|Error getting headers from headersHelper: (?P<message>[\s\S]*)|Header values reference unset environment variables: (?P<names>[\s\S]*))$'}
+  - {id: oauth.no_token, key: debug, category: oauth, status: observed,
+     pattern: '^No token data found$'}
+  - {id: xport.dropped, key: debug, category: shutdown, status: observed,
+     pattern: '^(?P<transport>[A-Z-]+) connection dropped after (?P<uptime_s>\d+)s uptime$'}
+  - {id: xport.conn_error, key: debug, category: shutdown, status: observed, mask: error_text,
+     pattern: '^Connection error: (?P<message>[\s\S]*)$'}
+  - {id: xport.conn_error_errno, key: debug, category: shutdown, status: static,
+     pattern: '^(?P<message>Connection reset - server may have crashed or restarted|Connection timeout - network issue or server unresponsive|Connection refused - server may be down|Broken pipe - server closed connection unexpectedly|Host unreachable - network connectivity issue|Process not found - stdio server process terminated|Failed to spawn process - check command and permissions)$'}
+  - {id: xport.terminal, key: debug, category: shutdown, status: observed,
+     pattern: '^Terminal connection error (?P<count>\d+)/(?P<max_count>\d+)$'}
+  - {id: xport.closed, key: debug, category: shutdown, status: observed,
+     pattern: '^(?P<transport>[A-Z-]+) connection closed after (?P<uptime_s>\d+)s \((?P<how>cleanly|with errors)\)$'}
+  - {id: xport.cache_cleared, key: debug, category: shutdown, status: observed,
+     pattern: '^Cleared connection cache for reconnection$'}
+  - {id: xport.session_expired, key: debug, category: reconnect, status: observed,
+     pattern: '^MCP session expired \(server no longer recognizes session ID\), triggering reconnection$'}
+  - {id: xport.sse_exhausted, key: debug, category: reconnect, status: observed,
+     pattern: '^SSE GET-stream reconnection exhausted[\s\S]*$'}
+  - {id: xport.closing, key: debug, category: shutdown, status: observed,
+     pattern: '^Closing transport \((?P<reason>[\s\S]*)\)$'}
+  - {id: xport.close_error, key: debug, category: shutdown, status: static, mask: error_text,
+     pattern: '^Error during close: (?P<message>[\s\S]*)$'}
+
+  # --- tool calls ---------------------------------------------------------------
+  - {id: tool.call, key: debug, category: tool, status: observed,
+     pattern: '^Calling MCP tool: (?P<tool>[\s\S]*)$'}
+  - {id: tool.done, key: debug, category: tool, status: observed,
+     pattern: '^Tool ''(?P<tool>[\s\S]*?)'' completed successfully in (?P<duration>\d+ms|\d+s|\d+m \d+s)$'}
+  - {id: tool.running, key: debug, category: tool, status: observed,
+     pattern: '^Tool ''(?P<tool>[\s\S]*?)'' still running \((?P<elapsed_s>\d+)s elapsed\)$'}
+  - {id: tool.failed, key: debug, category: tool, status: observed, mask: tool_error,
+     pattern: '^Tool ''(?P<tool>[\s\S]*?)'' failed after (?P<seconds>\d+)s: (?P<message>[\s\S]*)$'}
+  - {id: tool.abort_idle, key: debug, category: tool, status: static,
+     pattern: '^Tool ''(?P<tool>[\s\S]*?)'' aborting: no response or progress notification for (?P<idle_s>\d+)s \(idle timeout (?P<timeout_s>\d+)s\)$'}
+  - {id: tool.abort_transport, key: debug, category: tool, status: static,
+     pattern: '^Tool ''(?P<tool>[\s\S]*?)'' aborting: transport error (?P<ago_s>\d+)s ago, response presumed lost$'}
+  - {id: tool.url_elicitation, key: debug, category: elicitation, status: static,
+     pattern: '^Tool ''(?P<tool>[\s\S]*?)'' (?:requires URL elicitation \(error -32042[\s\S]*|returned -32042 but no valid elicitations in error data)$'}
+  - {id: tool.needs_approval, key: debug, category: tool, status: static,
+     pattern: '^Tool ''(?P<tool>[\s\S]*?)'' returned -32003 needs_approval[\s\S]*$'}
+  - {id: tool.auth_retry, key: debug, category: tool, status: static,
+     pattern: '^Tool ''(?P<tool>[\s\S]*?)'' (?:returned (?P<status_code>\S+); [\s\S]*retrying once|rejected the session credential[\s\S]*)$'}
+  - {id: tool.session_expired_in_call, key: debug, category: tool, status: observed,
+     pattern: '^MCP session expired during tool call \((?P<reason>[^)]*)\), clearing connection cache for re-initialization$'}
+  - {id: tool.auth_misc, key: debug, category: tool, status: static,
+     pattern: '^(?:Tool call returned 401 Unauthorized - token may have expired|Auth reconnect returned ''(?P<result>[^'']*)''; falling through to needs-auth)$'}
+  - {id: tool.retry_after_recovery, key: debug, category: tool, status: observed,
+     pattern: '^Retrying tool ''(?P<tool>[\s\S]*?)'' after session recovery$'}
+  - {id: tool.schema, key: any, category: tool-schema, status: static,
+     pattern: '^(?:Normalized input schema for tool "(?P<tool>[\s\S]*?)"[\s\S]*|Skipping tool "(?P<skipped_tool>[\s\S]*?)": [\s\S]*|Tool "(?P<rejected_tool>[\s\S]*?)" input schema would be rejected by the Anthropic API[\s\S]*)$'}
+  - {id: tool.bad_format, key: error, category: tool, status: static, fixed_text: true,
+     pattern: '^MCP server "(?P<server>[\s\S]*?)" tool "(?P<tool>[\s\S]*?)": unexpected response format$'}
+  - {id: tool.model_artifact, key: debug, category: tool, status: static,
+     pattern: '^stripped trailing </[^>]*></invoke> from [\s\S]*$'}
+
+  # --- elicitation, roots -------------------------------------------------------
+  - {id: elicit.request, key: debug, category: elicitation, status: observed, mask: elicitation_request,
+     pattern: '^Received elicitation request: (?P<json>[\s\S]*)$'}
+  - {id: elicit.request_print, key: debug, category: elicitation, status: observed, mask: elicitation_request,
+     pattern: '^Elicitation request received in print mode: (?P<json>[\s\S]*)$'}
+  - {id: elicit.request_init, key: debug, category: elicitation, status: static, mask: elicitation_request,
+     pattern: '^Elicitation request received during initialization: (?P<json>[\s\S]*)$'}
+  - {id: elicit.response, key: debug, category: elicitation, status: observed, mask: elicitation_response,
+     pattern: '^Elicitation response: (?P<json>[\s\S]*)$'}
+  - {id: elicit.hook, key: debug, category: elicitation, status: static, mask: elicitation_response,
+     pattern: '^(?:Elicitation resolved by hook|URL elicitation (?P<elicitation_id>\S+) resolved by hook): (?P<json>[\s\S]*)$'}
+  - {id: elicit.completion, key: debug, category: elicitation, status: static,
+     pattern: '^(?:Received elicitation completion notification|Elicitation completion notification|Ignoring completion notification for unknown elicitation): (?P<elicitation_id>[\s\S]*)$'}
+  - {id: elicit.url_user, key: debug, category: elicitation, status: static,
+     pattern: '^(?:User (?P<action>\S+) URL elicitation (?P<elicitation_id>\S+)|Elicitation (?P<completed_id>\S+) completed, retrying tool call)$'}
+  - {id: elicit.error, key: error, category: elicitation, status: static, mask: error_text,
+     pattern: '^(?:Elicitation error|Elicitation hook error|ElicitationResult hook error): (?P<message>[\s\S]*)$'}
+  - {id: roots.list, key: debug, category: roots, status: observed,
+     pattern: '^Received ListRoots request from server$'}
+
+  # --- list_changed, paging, subscriptions ---------------------------------------
+  - {id: list.changed, key: debug, category: list-changed, status: observed,
+     pattern: '^Received (?P<list>tools|prompts|resources)/list_changed notification, refreshing (?:tools|prompts|resources)$'}
+  - {id: list.synthesized, key: debug, category: list-changed, status: static,
+     pattern: '^Synthesized (?P<list>tools|prompts|resources) refetch after listen-stream reopen \(no notification received\)$'}
+  - {id: list.refresh_failed, key: any, category: list-changed, status: static, mask: error_text,
+     pattern: '^(?:Failed to refresh (?P<list>tools|prompts|resources) after list_changed notification: (?P<message>[\s\S]*)|tools/list failed after list_changed[\s\S]*|tools refresh returned the needs-auth empty list; keeping previous tools)$'}
+  - {id: list.paging, key: debug, category: list-changed, status: static,
+     pattern: '^(?:(?P<method>\S+) still returning nextCursor after (?P<pages>\d+) pages; stopping|(?P<failed_method>\S+) failed \([\s\S]*\); retrying in (?P<delay_ms>\d+)ms)$'}
+  - {id: list.subscriptions, key: debug, category: list-changed, status: static,
+     pattern: '^(?:Opened subscriptions/listen|Re-opened subscriptions/listen|subscriptions/listen |post-reopen list refetch failed|no auto-opened subscriptions/listen)[\s\S]*$'}
+  - {id: list.fetch_error, key: error, category: list-changed, status: static, mask: error_text,
+     pattern: '^Error fetching tools/commands/resources: (?P<message>[\s\S]*)$'}
+
+  # --- resources, prompts, skills, discovery cache ------------------------------------
+  - {id: resource.no_content, key: debug, category: resource, status: static,
+     pattern: '^No displayable content found in MCP resource (?P<uri>[\s\S]*)\.$'}
+  - {id: resource.read_error, key: error, category: resource, status: static,
+     pattern: '^resources/(?:directory/)?read returned [\s\S]*$'}
+  - {id: resource.directory_paging, key: debug, category: resource, status: static,
+     pattern: '^resources/directory/read [\s\S]*$'}
+  - {id: resource.list_error, key: any, category: resource, status: static, mask: error_text,
+     pattern: '^(?:Failed to get MCP resources|Failed to fetch resource templates|Failed to complete resource template|Failed to get claude\.ai MCP resources): (?P<message>[\s\S]*)$'}
+  - {id: prompt.error, key: any, category: prompt, status: static, mask: error_text,
+     pattern: '^Error running command ''(?P<name>[\s\S]*?)'': (?P<message>[\s\S]*)$'}
+  - {id: skills.any, key: any, category: skills, status: static,
+     pattern: '^(?:Found \d+ skills? via skills/list|Loaded MCP skill |Skill ''|Skill resource |skills/list|\d+ skills/list|SKILL\.md digest mismatch|Failed to load MCP skill|Failed to cache SKILL\.md)[\s\S]*$'}
+  - {id: discovery.any, key: debug, category: discovery-cache, status: static,
+     pattern: '^(?:discovery-cache: |Discovery cache refresh-failure strike refused)[\s\S]*$'}
+
+  # --- shutdown, process control ------------------------------------------------------
+  - {id: proc.sigint, key: debug, category: shutdown, status: observed,
+     pattern: '^Sending SIGINT to MCP server process$'}
+  - {id: proc.sigterm, key: debug, category: shutdown, status: observed,
+     pattern: '^SIGINT failed, sending SIGTERM to MCP server process$'}
+  - {id: proc.sigkill, key: debug, category: shutdown, status: static,
+     pattern: '^SIGTERM failed, sending SIGKILL to MCP server process$'}
+  - {id: proc.exited, key: debug, category: shutdown, status: observed,
+     pattern: '^MCP server process exited cleanly$'}
+  - {id: proc.cleanup_timeout, key: debug, category: shutdown, status: static,
+     pattern: '^Cleanup timeout reached, stopping process monitoring$'}
+  - {id: proc.error, key: debug, category: shutdown, status: static, mask: error_text,
+     pattern: '^(?:Error sending (?:SIGINT|SIGTERM|SIGKILL)|Error terminating process|Error closing client|Error closing in-process server): (?P<message>[\s\S]*)$'}
+
+  # --- automatic reconnection ------------------------------------------------------------
+  - {id: reconnect.start, key: debug, category: reconnect, status: observed,
+     pattern: '^(?P<transport>\S+) transport closed/disconnected, attempting automatic reconnection$'}
+  - {id: reconnect.schedule, key: debug, category: reconnect, status: static,
+     pattern: '^Scheduling reconnection attempt (?P<attempt>\d+) in (?P<delay_ms>\d+)ms$'}
+  - {id: reconnect.ok, key: debug, category: reconnect, status: observed,
+     pattern: '^(?P<transport>\S+) reconnection successful after (?P<elapsed_ms>\d+)ms \(attempt (?P<attempt>\d+)\)$'}
+  - {id: reconnect.status, key: debug, category: reconnect, status: static,
+     pattern: '^(?P<transport>\S+) reconnection attempt (?P<attempt>\d+) completed with status: (?P<status_text>[\s\S]*)$'}
+  - {id: reconnect.failed, key: any, category: reconnect, status: static, mask: error_text,
+     pattern: '^(?P<transport>\S+) reconnection attempt (?P<attempt>\d+) failed after (?P<elapsed_ms>\d+)ms: (?P<message>[\s\S]*)$'}
+  - {id: reconnect.stop, key: debug, category: reconnect, status: static,
+     pattern: '^(?:Max reconnection attempts \((?P<max_attempts>\d+)\) reached, giving up|Server is disabled, skipping automatic reconnection|Server disabled during reconnection, stopping retry|Server blocked by managed policy during reconnection, stopping retry|Reconnect returned ''needs-auth''; retrying once after cache clear|Reconnection failed after authentication)$'}
+  - {id: reconnect.error, key: any, category: reconnect, status: static, mask: error_text,
+     pattern: '^Error during reconnection: (?P<message>[\s\S]*)$'}
+
+  # --- configuration churn -------------------------------------------------------------------
+  - {id: config.churn, key: debug, category: config, status: static,
+     pattern: '^(?:reconcileMcpServers: config changed, will replace \(caller=(?P<caller>[^)]*)\)|excludeStalePluginClients: marking stale[\s\S]*|applyConnectionResult: disposing orphaned connect[\s\S]*)$'}
+
+  # --- OAuth / XAA (token values are never logged) --------------------------------------------
+  - {id: oauth.server_url, key: debug, category: oauth, status: static,
+     pattern: '^Server URL: (?P<url>\S+)$'}
+  - {id: oauth.auth_url, key: debug, category: oauth, status: static,
+     pattern: '^(?:Authorization URL|Opening authorization URL|Skipping browser open \([^)]*\)\. URL): (?P<url>\S+)$'}
+  - {id: oauth.xaa_secret_miss, key: debug, category: oauth, status: static, mask: config_headers,
+     pattern: '^XAA: secret lookup miss\. [\s\S]*$'}
+  - {id: oauth.other, key: any, category: oauth, status: static,
+     pattern: '^(?:XAA[: ]|OAuth |Orphan-connection cleanup failed|Token |Tokens after auth|Has refresh token|Expires in|No expiration specified|Saving tokens|Returning tokens|No access token|Starting SDK auth|Initial auth result|Auth result|Unexpected auth result|SDK auth error|Completing auth flow|Error during auth completion|Fetched OAuth metadata|Failed to fetch OAuth metadata|MCP OAuth server cleaned up|Received auth code|Using (?:cached id_token|custom redirectUri|redirect port|scope from metadata|scopes from metadata|CIMD URL|pre-configured client ID)|No cached id_token|Opening browser to IdP|Cached id_token|id_token cache write failed|RFC 9728 discovery failed|Path-aware auth server discovery failed|issuer-echo telemetry failed|clear |drop clientId|clearIdp|No client_id available|Successfully revoked|Got 401, retrying|No OAuth metadata found|Server does not support token revocation|Revoking tokens|Failed to revoke|No replaced tokens|No tokens to revoke|Preserved step-up|Cleared stored tokens|Token persist failed|Invalid cached resourceMetadataUrl|Marked step-up|Generated new OAuth state|Cached client_id|Found client info|No client info found|saveClientInformation|Step-up pending|Overrode authorization scope|Appended offline_access|Scopes in URL|Captured scopes|No scopes available|step-up scope|Persisted step-up|Redirection handling|Redirecting to authorization URL|Browser didn''t open|Saving code verifier|No code verifier|Returning code verifier|Invalidated credentials|invalidateCredentials|Saving discovery state|saveDiscoveryState|Fetching metadata from configured URL|Failed to fetch from configured metadata URL|Returning cached discovery state|Acquiring refresh lock|Refresh lock|Acquired refresh lock|Failed to acquire refresh lock|Could not acquire refresh lock|Another process|Released refresh lock|Failed to release refresh lock|Starting token refresh|Re-discovering metadata|Failed to discover OAuth metadata|No client information available|No valid tokens in storage)[\s\S]*$'}
+
+# MCP-relevant debug-file lines that are not mirror lines.
+# level: VERBOSE | DEBUG | INFO | WARN | ERROR | any
+debug_file_lines:
+  - {id: dbg.dispatch_start, level: INFO, category: dispatch, status: observed,
+     pattern: '^\[Stall\] tool_dispatch_start tool=(?P<tool>\S+) toolUseId=(?P<tool_use_id>\S+) permissionDecisionMs=(?P<permission_decision_ms>\d+)$'}
+  - {id: dbg.dispatch_end, level: INFO, category: dispatch, status: observed,
+     pattern: '^\[Stall\] tool_dispatch_end tool=(?P<tool>\S+) toolUseId=(?P<tool_use_id>\S+) outcome=(?P<outcome>\S+) durationMs=(?P<duration_ms>\d+)$'}
+  - {id: dbg.dispatch_post_error, level: INFO, category: dispatch, status: static,
+     pattern: '^\[Stall\] tool_dispatch_post_error tool=(?P<tool>\S+) toolUseId=(?P<tool_use_id>\S+) durationMs=(?P<duration_ms>\d+)$'}
+  - {id: dbg.permission_denied, level: any, category: permission, status: observed,
+     pattern: '^(?P<tool>\S+) tool permission denied$'}
+  - {id: dbg.permission_suggestions, level: any, category: permission, status: observed, mask: permission_rules,
+     pattern: '^Permission suggestions for (?P<tool>\S+): (?P<rules>\[[\s\S]*)$'}
+  - {id: dbg.permission_hooks, level: any, category: permission, status: observed,
+     pattern: '^executePermissionRequestHooks called for tool: (?P<tool>\S+)$'}
+  - {id: dbg.permission_update, level: any, category: permission, status: observed, mask: permission_rules,
+     pattern: '^Applying permission update: (?P<op>Adding|Removing) (?P<count>\d+) (?P<behavior>allow|deny|ask) rule\(s\) (?:to destination|from source) ''(?P<destination>\w+)'': (?P<rules>[\s\S]*)$'}
+  - {id: dbg.permission_persist, level: any, category: permission, status: observed,
+     pattern: '^Persisting permission update: (?P<update_type>\w+) to source ''(?P<destination>\w+)''$'}
+  - {id: dbg.permission_replace, level: any, category: permission, status: observed, mask: permission_rules,
+     pattern: '^Replacing all (?P<behavior>allow|deny|ask) rules for destination ''(?P<destination>\w+)'' with (?P<count>\d+) rule\(s\): (?P<rules>[\s\S]*)$'}
+  - {id: dbg.permission_slow, level: any, category: permission, status: static,
+     pattern: '^Slow permission decision: (?P<decision_ms>\d+)ms for (?P<tool>\S+) \(mode=(?P<mode>[^,]+), behavior=(?P<behavior>[^)]+)\)$'}
+  - {id: dbg.mcp_configs_loading, level: any, category: config, status: observed,
+     pattern: '^\[STARTUP\] (?:Loading MCP configs\.\.\.|MCP configs resolved in (?P<resolve_ms>\d+)ms[\s\S]*)$'}
+  - {id: dbg.runtime_arm, level: any, category: config, status: observed,
+     pattern: '^mcp runtime arm: (?P<arm>\S+) \(source: (?P<arm_source>[^)]*)\)$'}
+  - {id: dbg.mcp_async, level: any, category: config, status: observed,
+     pattern: '^\[MCP\] (?P<what>--mcp-config servers|claude\.ai connectors) running fully async[\s\S]*$'}
+  - {id: dbg.mcp_server_connected, level: any, category: connection, status: observed,
+     pattern: '^\[MCP\] Server "(?P<server>[\s\S]+?)" connected with subscribe=(?P<subscribe>true|false)$'}
+  - {id: dbg.mcp_retry, level: any, category: connection, status: observed,
+     pattern: '^\[MCP\] Retry: (?P<count>\d+) transiently-failed remote server\(s\) after (?P<backoff_ms>\d+)ms backoff$'}
+  - {id: dbg.mcp_config_error, level: any, category: config, status: static,
+     pattern: '^(?:MCP config (?:skipped for|read error for|is not valid JSON:) [\s\S]*|MCP config errors for [\s\S]*|Enterprise MCP config errors[\s\S]*)$'}
+  - {id: dbg.settings_missing, level: any, category: config, status: observed,
+     pattern: '^Broken symlink or missing file encountered for settings\.json at path: (?P<path>[\s\S]+)$'}
+  - {id: dbg.claudeai_mcp, level: any, category: config, status: observed,
+     pattern: '^\[claudeai-mcp\] (?P<detail>[\s\S]*)$'}
+  - {id: dbg.mcp_registry, level: any, category: config, status: observed,
+     pattern: '^\[mcp-registry\] Loaded (?P<count>\d+) official MCP URLs[\s\S]*$'}
+  - {id: dbg.mcp_setup_issue, level: any, category: config, status: observed,
+     pattern: '^(?P<count>\d+) setup issues?: MCP \(run /mcp for details\)$'}
+  - {id: dbg.log_batch_dropped, level: any, category: mcp-log-writer, status: observed,
+     pattern: '^Dropping log batch for (?P<path>[\s\S]+?): (?P<error>[\s\S]+)$'}
+  - {id: dbg.cleanup_skipped, level: any, category: retention, status: observed,
+     pattern: '^Skipping cleanup: settings have validation errors[\s\S]*$'}
+  - {id: dbg.cleanup_error, level: any, category: retention, status: static,
+     pattern: '^(?:Failed to clean up file [\s\S]*|cleanup (?:readdir|mcp-logs scan) [\s\S]* failed: \S+)$'}
+  - {id: dbg.tool_not_found_render, level: any, category: list-changed, status: observed,
+     pattern: '^Tool (?P<tool>mcp__\S+) not found in render-time tools$'}
+  - {id: dbg.list_changed_failed, level: any, category: list-changed, status: static, mask: error_text,
+     pattern: '^\[mcp\] (?P<server>[\s\S]+?): tools/list_changed refresh failed \((?P<message>[\s\S]*)\)$'}
+  - {id: dbg.telemetry_mcp, level: any, category: connection, status: observed,
+     pattern: '^\[3P telemetry\] Event dropped \(no event logger initialized\): mcp_server_connection$'}
+  - {id: dbg.resume_link, level: any, category: session, status: observed,
+     pattern: '^FileHistory: No need to copy file history for resuming with same session id: (?P<session_id>[0-9a-fA-F-]{36})$'}
+  - {id: dbg.prior_unclean, level: any, category: session, status: observed,
+     pattern: '^Prior session exited uncleanly: (?P<session_id>[0-9a-fA-F-]{36}) \(v(?P<version>[^)]+)\)$'}
+  - {id: dbg.process_start, level: any, category: process, status: observed,
+     pattern: '^MDM settings load completed in (?P<ms>\d+)ms$'}
+  - {id: dbg.uds_listening, level: any, category: process, status: observed,
+     pattern: '^\[uds-messaging\] Listening: (?P<socket>\S*?/(?P<pid>\d+)\.sock)$'}
+  - {id: dbg.entrypoint, level: any, category: process, status: observed,
+     pattern: '^attribution header x-anthropic-billing-header: cc_version=(?P<cc_version>[^;]+); cc_entrypoint=(?P<entrypoint>[^;]+);[\s\S]*$'}
