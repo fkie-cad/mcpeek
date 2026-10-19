@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.1 (2026-10-19)
+
+- `--session` also takes the transcript file name with `.jsonl` and ignores a trailing `/`.
+- A `--session` value that matches nothing within the projects chosen by `--project` says so, and an ambiguous value lists every project folder of each candidate.
+- Documentation: which lines `sessions --quick` skips, which records of the transcripts not selected a filter reads, and what `info` shows of the files read for the pairing only.
+
 ## 1.1.0 (2026-10-19)
 
 - `sessions --quick` lists every top-level transcript without parsing it: session id, cwd and first timestamp from its first records, last timestamp read from the end of the file (at most 8 MiB from each end, lines over 1 MiB skipped), file size and mtime, and the number of sub-agent sidecars and spilled results (names in its companion folder only). Newest activity first; `--limit N` keeps the N most recent. It reads no MCP log or `--debug` file and follows the same symlink and containment rules as the other commands.

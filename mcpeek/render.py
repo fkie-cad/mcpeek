@@ -781,8 +781,8 @@ def render_quick_sessions(console: Console, rows: list[dict], total: int, flt=No
     console.print(table)
     shown = f"{len(rows)} of {total}" if len(rows) != total else str(total)
     _say(console, f"{shown} transcript(s); first/last: timestamps of the first and last records that carry one "
-                  "(at most 8 MiB read from each end, lines over 1 MiB skipped); sub-agents: agent-*.meta.json in "
-                  "<session>/subagents/; spilled: files in <session>/tool-results/", "dim")
+                  "(at most 8 MiB read from each end, lines over 1 MiB at the start skipped); sub-agents: "
+                  "agent-*.meta.json in <session>/subagents/; spilled: files in <session>/tool-results/", "dim")
     if flt is not None:
         _say(console, filter_summary(flt), "dim")
 

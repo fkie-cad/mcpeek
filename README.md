@@ -44,7 +44,7 @@ target root).
 | `--home PATH` | HOME on the examined host that the target root stands for, for example `/root` or `/home/alice` (see [Project paths and HOME](https://github.com/fkie-cad/mcpeek#project-paths-and-home)). Inferred if not given. |
 | `--cache-dir DIR` | Additional cache folder holding `claude-cli-nodejs/` (for example a relocated `XDG_CACHE_HOME`), or that folder itself. Repeatable. A project or server folder inside a cache folder that is found anyway is read as part of that folder. |
 | `--debug-file PATH` | Additional `--debug` file, or folder of them (for example from `claude --debug-file` or `CLAUDE_CODE_DEBUG_LOGS_DIR`). Repeatable. |
-| `--session ID` | Only this session: the session id `sessions --quick` shows, the transcript file name, or a prefix of at least 4 characters (see [Selecting sessions](https://github.com/fkie-cad/mcpeek#selecting-sessions)). Repeatable. |
+| `--session ID` | Only this session: the session id `sessions --quick` shows, the transcript file name (with or without `.jsonl`), or a prefix of at least 4 characters (see [Selecting sessions](https://github.com/fkie-cad/mcpeek#selecting-sessions)). Repeatable. |
 | `--project P` | Only the sessions of this project: the encoded project folder name, the project path on the examined host, or a prefix of the folder name (see [Selecting sessions](https://github.com/fkie-cad/mcpeek#selecting-sessions)). Repeatable. |
 | `--json` | Print JSON instead of tables. Not valid for `report`. JSON keeps values exact; tables, warnings and reports show control characters from the evidence as `\xNN` escapes. |
 | `--redact` | Mask credential-shaped configuration values (see [Sensitive data](https://github.com/fkie-cad/mcpeek#sensitive-data)). |
@@ -79,14 +79,15 @@ A live home can hold hundreds of transcripts and many gigabytes. `sessions --qui
 parsing them: per `.claude/projects/<project>/<session>.jsonl` it reads the file size and mtime, the session id,
 cwd and first timestamp from the first records, the last timestamp from the end of the file, and the number of
 names in `<session>/subagents/` (`agent-*.meta.json`) and `<session>/tool-results/`, newest activity first. It
-reads at most 8 MiB from each end of a transcript and skips lines over 1 MiB, so cwd, first or last can be `-`.
+reads at most 8 MiB from each end of a transcript and skips lines over 1 MiB at the start, so cwd, first or last
+can be `-`.
 First and last come from the first and last records that carry a timestamp; `sessions` (without `--quick`) takes
 the earliest and latest user and assistant record, so the two can differ by a moment.
 
 Pick a session there and pass it to any command:
 
-- `--session ID`: the session id `sessions --quick` shows, the transcript file name, or a prefix of either (at
-  least 4 characters).
+- `--session ID`: the session id `sessions --quick` shows, the transcript file name (with or without `.jsonl`), or
+  a prefix of either (at least 4 characters).
 - `--project P`: the encoded project folder name (`-home-alice-project`), the project path on the examined host
   (`/home/alice/project`, encoded as the CLI does: every character other than `A-Z`, `a-z`, `0-9` becomes `-`), or
   a prefix of the folder name.
@@ -105,9 +106,10 @@ mcpeek -t ~ --project ~/project sessions
 What a filter keeps:
 
 - **Transcripts:** only the selected ones are parsed, with their sub-agent and spilled-result folders. Of the
-  others MCPeek reads the first records, for the session ids and HOME. When that read finds no cwd record because
-  it stopped at 8 MiB or skipped a line over 1 MiB, the transcript is read for its cwd as without a filter. Every
-  transcript listed under a selected session id is selected, also a copy in another project folder.
+  others MCPeek reads the first records, for the session ids and HOME, and the last records when the first session
+  id differs from the file name. When the first read finds no cwd record because it stopped at 8 MiB or skipped a
+  line over 1 MiB, the transcript is read for its cwd as without a filter. Every transcript listed under a selected
+  session id is selected, also a copy in another project folder.
 - **MCP logs:** the files in which a selected session appears (the leading record that `--continue` writes counts
   with the session that follows it). In them, the calls of other sessions (after a `/clear` switch, for example)
   and their session-bound events are left out and counted per file, never shown as log-only; server process
@@ -116,8 +118,9 @@ What a filter keeps:
   withheld, also with `--show-sensitive`.
 - **`--debug` files:** those named after a selected session or paired with its MCP-log records. To pair mirror
   lines exactly as an unfiltered run does, MCPeek also reads the log files of other sessions whose records or
-  mirror lines lie within the pairing window (concurrent sessions). Their rows and records are not shown; `info`,
-  `logs` and `report` name each of them with the calls, events and records of other sessions it holds.
+  mirror lines lie within the pairing window (concurrent sessions). Their rows and records are not shown. `info`
+  counts them, and `info --json`, `logs` and `report` name each of them with the calls, events and records of
+  other sessions it holds.
 
 The calls, joins, durations and cross-check of a selected session are those of an unfiltered run. `credentials`
 and `grants` list the configuration in full, and so does `servers` for the configured servers. Its rows of servers

@@ -74,11 +74,11 @@ from .parse import build_case, session_filter
     "session_values",
     multiple=True,
     metavar="ID",
-    help="Only this session: the session id `sessions --quick` shows, the transcript file name, or a prefix of "
-    "either (at least 4 characters) that no other session has. Repeatable. Only the selected transcripts are "
-    "parsed, with their sub-agent and spilled-result folders; MCP logs and --debug files are narrowed to the "
-    "selected sessions (see README, Selecting sessions). An ambiguous prefix is a usage error that lists the "
-    "candidates; one that matches nothing is a usage error that points to `sessions --quick`.",
+    help="Only this session: the session id `sessions --quick` shows, the transcript file name (with or without "
+    ".jsonl), or a prefix of either (at least 4 characters) that no other session has. Repeatable. Only the "
+    "selected transcripts are parsed, with their sub-agent and spilled-result folders; MCP logs and --debug files "
+    "are narrowed to the selected sessions (see README, Selecting sessions). An ambiguous prefix is a usage error "
+    "that lists the candidates; one that matches nothing is a usage error that points to `sessions --quick`.",
 )
 @click.option(
     "--project",
@@ -274,8 +274,8 @@ def _filter_foot(ctx: click.Context, case: Case, note: str | None = None) -> Non
     help="List every top-level transcript without parsing it: session id, cwd and first timestamp from its first "
     "records, last timestamp from its last records (read from the end of the file), file size and mtime, and the "
     "number of sub-agent sidecars and spilled results (names in its companion folder). At most 8 MiB are read from "
-    "each end and lines over 1 MiB are skipped, so cwd, first or last can be '-'. Newest last activity first. Reads "
-    "no MCP log or --debug file.",
+    "each end and lines over 1 MiB at the start are skipped, so cwd, first or last can be '-'. Newest last "
+    "activity first. Reads no MCP log or --debug file.",
 )
 @click.option("--limit", type=click.IntRange(min=1), default=None, metavar="N",
               help="With --quick: only the N sessions with the most recent activity (default: all).")

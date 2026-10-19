@@ -644,28 +644,38 @@ def match_project(value: str, folders: list[str]) -> str:
 SESSION_PREFIX_MIN = 4
 
 
-def match_session(value: str, heads: list[TranscriptHead]) -> str:
+def match_session(value: str, heads: list[TranscriptHead], within: Optional[list[str]] = None) -> str:
     """What a --session value names: a session id (as its first records give
-    it) or a transcript file name, or a prefix of one (at least
-    SESSION_PREFIX_MIN characters) that only one session has."""
-    if len(value) < SESSION_PREFIX_MIN:
-        raise SelectionError(f"--session {value!r}: give at least {SESSION_PREFIX_MIN} characters of a session id")
+    it) or a transcript file name (with or without .jsonl), or a prefix of
+    one (at least SESSION_PREFIX_MIN characters) that only one session has.
+    ``within`` names the project folders --project narrowed ``heads`` to."""
     names = sorted({n for h in heads for n in h.names})
+    if value in names:
+        return value
+    given = value
+    value = value.rstrip("/\\") or value  # a trailing separator
+    if value.endswith(".jsonl") and len(value) > len(".jsonl"):
+        value = value[:-len(".jsonl")]
+    if len(value) < SESSION_PREFIX_MIN:
+        raise SelectionError(f"--session {given!r}: give at least {SESSION_PREFIX_MIN} characters of a session id")
     if value in names:
         return value
     cands = [n for n in names if n.startswith(value)]
     if not cands:
-        raise SelectionError(f"--session {value!r}: no session id or transcript file name starts with it "
-                             f"({len(heads)} transcript(s) considered; `sessions --quick` lists the session ids)")
+        scope = (f"in the project folder(s) chosen by --project: {_candidates_text(sorted(within))}"
+                 if within else "considered")
+        raise SelectionError(f"--session {given!r}: no session id or transcript file name starts with it "
+                             f"({len(heads)} transcript(s) {scope}; `sessions --quick` lists the session ids)")
     files = {c: frozenset(str(h.path) for h in heads if c in h.names) for c in cands}
     if len(set(files.values())) == 1:  # one transcript, under its first id and its file name
         return cands[0]
-    where = {}
+    where: dict[str, set[str]] = {}
     for h in heads:
         for n in h.names:
-            where.setdefault(n, h.project_dir)
-    raise SelectionError(f"--session {value!r} matches {len(cands)} sessions: "
-                         + _candidates_text([f"{c} ({where[c]})" for c in cands]) + "; give more of the id")
+            where.setdefault(n, set()).add(h.project_dir)
+    raise SelectionError(f"--session {given!r} matches {len(cands)} sessions: "
+                         + _candidates_text([f"{c} ({', '.join(sorted(where[c]))})" for c in cands])
+                         + "; give more of the id")
 
 
 # ---------------------------------------------------------------------------
@@ -1396,17 +1406,17 @@ class TargetLoader:
         that session do not depend on the filter. Raises SelectionError."""
         sel = self.selection
         heads = [read_transcript_head(j, p.name) for p, j in found]
-        pool = heads
+        pool, within = heads, None
         if sel.projects:
             folders = list(self._project_folders)
             chosen = {match_project(v, folders) for v in sel.projects}
-            pool = [h for h in heads if h.project_dir in chosen]
+            pool, within = [h for h in heads if h.project_dir in chosen], sorted(chosen)
             if not pool:
                 raise SelectionError(f"--project: no session transcript in {', '.join(sorted(chosen))}")
         if sel.sessions:
             if not pool:
                 raise SelectionError("--session: no session transcript found under the target root")
-            names = {match_session(v, pool) for v in sel.sessions}
+            names = {match_session(v, pool, within) for v in sel.sessions}
             picked = [h for h in pool if h.names & names]
         else:
             picked = list(pool)
