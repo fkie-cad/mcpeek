@@ -44,6 +44,8 @@ target root).
 | `--home PATH` | HOME on the examined host that the target root stands for, for example `/root` or `/home/alice` (see [Project paths and HOME](https://github.com/fkie-cad/mcpeek#project-paths-and-home)). Inferred if not given. |
 | `--cache-dir DIR` | Additional cache folder holding `claude-cli-nodejs/` (for example a relocated `XDG_CACHE_HOME`), or that folder itself. Repeatable. A project or server folder inside a cache folder that is found anyway is read as part of that folder. |
 | `--debug-file PATH` | Additional `--debug` file, or folder of them (for example from `claude --debug-file` or `CLAUDE_CODE_DEBUG_LOGS_DIR`). Repeatable. |
+| `--session ID` | Only this session: the session id `sessions --quick` shows, the transcript file name, or a prefix of at least 4 characters (see [Selecting sessions](https://github.com/fkie-cad/mcpeek#selecting-sessions)). Repeatable. |
+| `--project P` | Only the sessions of this project: the encoded project folder name, the project path on the examined host, or a prefix of the folder name (see [Selecting sessions](https://github.com/fkie-cad/mcpeek#selecting-sessions)). Repeatable. |
 | `--json` | Print JSON instead of tables. Not valid for `report`. JSON keeps values exact; tables, warnings and reports show control characters from the evidence as `\xNN` escapes. |
 | `--redact` | Mask credential-shaped configuration values (see [Sensitive data](https://github.com/fkie-cad/mcpeek#sensitive-data)). |
 | `--show-sensitive` | Print the log values that are withheld by default (see [Sensitive data](https://github.com/fkie-cad/mcpeek#sensitive-data)). Cannot be combined with `--redact`. |
@@ -55,7 +57,7 @@ target root).
 | `info` | Case overview: HOME used and how it was determined, counts, negotiated MCP protocol versions (when a `--debug` file records them), MCP log and debug-file summary, warnings. |
 | `servers` | Configured MCP servers by scope (transport, command, args and env, or URL, headers and `headersHelper`, and the configured `oauth` object such as `clientId` and `callbackPort`; a configured `type` that is not a known transport, or `"type": null`, is shown as `unknown` with the value as written, `type_raw` in JSON; an entry with both `command` and `url` and no `type` shows both, labelled) with `--debug` file and MCP log details, plus servers seen only in the logs. A remote server URL recorded in the MCP log is shown as `(from MCP log)` when the server has no configured URL or the recorded URL differs from it (query values withheld by default). |
 | `tools` | MCP tools observed being called, with transcript and MCP-log call counts. A log call joined to a transcript call counts under that call's server; other log calls in a folder shared by several server names count on a row for the folder, with the candidate names. |
-| `sessions` | Session transcripts with cwd, time range and message, tool-call, MCP-call and sub-agent counts. |
+| `sessions` | Session transcripts with cwd, time range and message, tool-call, MCP-call and sub-agent counts. `--quick` lists them without parsing them (see [Selecting sessions](https://github.com/fkie-cad/mcpeek#selecting-sessions)), `--limit N` keeps the N with the most recent activity. |
 | `timeline` | Tool-call timeline across the main transcript and every sub-agent sidecar, in timestamp order across all sessions, with session, nesting depth, denials, spilled results, MCP log annotations and server events (a connect event names the remote server URL recorded in the MCP log). Log calls without a transcript call have no depth (the MCP log cannot tell delegated from direct calls). A call the CLI retried after session recovery (two `Calling` records linked by a `Retrying tool 'T' after session recovery` record) is one log call, marked `retried after session recovery`; the attempts are in its `notes` in JSON output. The default view shows MCP calls, sub-agent spawns, log calls without a unique transcript match and server events, and counts the other tools. `--all-tools` shows every call, `--mcp-only` only `mcp__*` calls (without server events), `--no-server-events` hides the server event rows (connect, shutdown, elicitation, ...). |
 | `logs` | Per-file details of the MCP logs and `--debug` files, the cross-check between them, and the withheld sensitive values. `--records` lists every record, `--file TEXT` keeps only files whose path contains `TEXT`. |
 | `credentials` | MCP OAuth client registrations: client id kind (DCR, CIMD or unknown), client id, issuer, redirect URI, and whether an access or refresh token is present. |
@@ -70,6 +72,60 @@ mcpeek -t /evidence/home/user timeline --mcp-only
 mcpeek --json -t /evidence/home/user timeline > timeline.json
 mcpeek --cache-dir /evidence/xdg-cache --debug-file /evidence/debug.log -t /evidence/home/user logs
 ```
+
+## Selecting sessions
+
+A live home can hold hundreds of transcripts and many gigabytes. `sessions --quick` lists them in seconds without
+parsing them: per `.claude/projects/<project>/<session>.jsonl` it reads the file size and mtime, the session id,
+cwd and first timestamp from the first records, the last timestamp from the end of the file, and the number of
+names in `<session>/subagents/` (`agent-*.meta.json`) and `<session>/tool-results/`, newest activity first. It
+reads at most 8 MiB from each end of a transcript and skips lines over 1 MiB, so cwd, first or last can be `-`.
+First and last come from the first and last records that carry a timestamp; `sessions` (without `--quick`) takes
+the earliest and latest user and assistant record, so the two can differ by a moment.
+
+Pick a session there and pass it to any command:
+
+- `--session ID`: the session id `sessions --quick` shows, the transcript file name, or a prefix of either (at
+  least 4 characters).
+- `--project P`: the encoded project folder name (`-home-alice-project`), the project path on the examined host
+  (`/home/alice/project`, encoded as the CLI does: every character other than `A-Z`, `a-z`, `0-9` becomes `-`), or
+  a prefix of the folder name.
+
+Both are repeatable. An ambiguous value is a usage error (exit 2) that lists the candidates. A value that matches
+nothing is a usage error too: for `--session` it points to `sessions --quick`, for `--project` it lists the project
+folders.
+
+```bash
+mcpeek -t ~ sessions --quick --limit 10
+mcpeek -t ~ --session 1b2c3d4e info
+mcpeek -t ~ --session 1b2c3d4e timeline --mcp-only
+mcpeek -t ~ --project ~/project sessions
+```
+
+What a filter keeps:
+
+- **Transcripts:** only the selected ones are parsed, with their sub-agent and spilled-result folders. Of the
+  others MCPeek reads the first records, for the session ids and HOME. When that read finds no cwd record because
+  it stopped at 8 MiB or skipped a line over 1 MiB, the transcript is read for its cwd as without a filter. Every
+  transcript listed under a selected session id is selected, also a copy in another project folder.
+- **MCP logs:** the files in which a selected session appears (the leading record that `--continue` writes counts
+  with the session that follows it). In them, the calls of other sessions (after a `/clear` switch, for example)
+  and their session-bound events are left out and counted per file, never shown as log-only; server process
+  events (connect, shutdown, session switch) are kept. `logs` lists only the records of the selected sessions,
+  records without a session id, and the withheld values in them. Values from other sessions' records stay
+  withheld, also with `--show-sensitive`.
+- **`--debug` files:** those named after a selected session or paired with its MCP-log records. To pair mirror
+  lines exactly as an unfiltered run does, MCPeek also reads the log files of other sessions whose records or
+  mirror lines lie within the pairing window (concurrent sessions). Their rows and records are not shown; `info`,
+  `logs` and `report` name each of them with the calls, events and records of other sessions it holds.
+
+The calls, joins, durations and cross-check of a selected session are those of an unfiltered run. `credentials`
+and `grants` list the configuration in full, and so does `servers` for the configured servers. Its rows of servers
+not in the current configuration and its MCP log details come from the log files shown, and each server gets its
+calls in the selected sessions and the connection attempts in those files. `info` shows the filter and what it
+left out. JSON output carries a `filter` object: list outputs become `{"filter": {...}, "<name>": [...]}`, and
+`info` and `logs` get a `filter` key. The configuration views also carry `filter_applies` (`false` for
+`credentials` and `grants`, `true` for `servers`) and `filter_note`, which says what is complete.
 
 ## Supported artifacts
 
@@ -179,6 +235,10 @@ interpret an offset or a missing record.
   root (for example `<target>/.claude-work/.claude.json`) is named in a warning and not read.
 - Project-scope `settings.local.json` and `.mcp.json` files are found only for project paths below HOME of the
   examined host whose folders are part of the target root.
+- Under `--session` or `--project`, a server name that only the transcripts or `--debug` files of other sessions
+  record is not a candidate name for an MCP-log folder. A transcript whose file name is not one of its session ids
+  and whose first and last records both give ids other than its most frequent one is listed by `sessions` under
+  that most frequent id, which `--session` does not match (its other ids and its file name do).
 - MCPeek does not recover tool descriptions or input schemas, read network captures, or verify the integrity of
   the artifacts (transcripts are not authenticated). A missing record is reported, not treated as proof that
   something did not happen.

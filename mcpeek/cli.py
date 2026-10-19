@@ -2,7 +2,9 @@
 
 Nine subcommands (servers, tools, sessions, timeline, logs, credentials,
 grants, info, report), global options -t/--target, --home, --cache-dir,
---debug-file, --json, --redact, --show-sensitive, and (on `timeline` only)
+--debug-file, --session, --project, --json, --redact, --show-sensitive,
+`sessions --quick` (a listing from the first and last records of each
+transcript, without parsing it), and (on `timeline` only)
 the native-tool visibility toggle: default shows MCP calls plus
 subagent-spawn rows as first class and native tools as counts only,
 --all-tools shows every call tagged, --mcp-only shows strictly mcp__* calls
@@ -21,9 +23,9 @@ from rich.console import Console
 from rich.text import Text
 
 from . import render
-from .loader import TargetLoader
+from .loader import SelectionError, SessionSelection, TargetLoader
 from .models import Case
-from .parse import build_case
+from .parse import build_case, session_filter
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -67,6 +69,27 @@ from .parse import build_case
     help="Additional --debug file (or folder of them), e.g. a path given to `claude --debug-file` or "
     "CLAUDE_CODE_DEBUG_LOGS_DIR. Repeatable. .claude/debug/ under the target is always read.",
 )
+@click.option(
+    "--session",
+    "session_values",
+    multiple=True,
+    metavar="ID",
+    help="Only this session: the session id `sessions --quick` shows, the transcript file name, or a prefix of "
+    "either (at least 4 characters) that no other session has. Repeatable. Only the selected transcripts are "
+    "parsed, with their sub-agent and spilled-result folders; MCP logs and --debug files are narrowed to the "
+    "selected sessions (see README, Selecting sessions). An ambiguous prefix is a usage error that lists the "
+    "candidates; one that matches nothing is a usage error that points to `sessions --quick`.",
+)
+@click.option(
+    "--project",
+    "project_values",
+    multiple=True,
+    metavar="P",
+    help="Only sessions of this project: the encoded project folder name under .claude/projects, the project path "
+    "on the examined host (encoded the way the CLI does: every character other than A-Z, a-z, 0-9 becomes '-'), or "
+    "a prefix of the folder name that only one folder has. Repeatable. With --session, the --session values are "
+    "matched within these projects. A value that matches no folder or several is a usage error that lists them.",
+)
 @click.option("--json", "as_json", is_flag=True, help="Emit machine-readable JSON instead of a table.")
 @click.option(
     "--redact",
@@ -88,12 +111,14 @@ from .parse import build_case
     "stderr, HTTP header values, URL userinfo, query values and fragments, tool error text, error text of "
     "connection and transport errors, the text of records no template matches, elicitation questions, schemas "
     "and answers, proxy settings, permission rules). By default they are withheld and listed by kind, size, "
-    "SHA-256 prefix (both over exactly the printed value) and source file:line.",
+    "SHA-256 prefix (both over exactly the printed value) and source file:line. Under --session or --project "
+    "the values of other sessions' records stay withheld.",
 )
 @click.version_option(package_name="mcpeek")
 @click.pass_context
 def main(ctx: click.Context, target: str, home: str | None, cache_dirs: tuple[str, ...],
-         debug_files: tuple[str, ...], as_json: bool, redact: bool, show_sensitive: bool) -> None:
+         debug_files: tuple[str, ...], session_values: tuple[str, ...], project_values: tuple[str, ...],
+         as_json: bool, redact: bool, show_sensitive: bool) -> None:
     """MCPeek -- a read-only, offline forensic CLI for reconstructing MCP
     activity from Claude Code CLI on-disk artifacts.
 
@@ -116,9 +141,17 @@ def main(ctx: click.Context, target: str, home: str | None, cache_dirs: tuple[st
     userinfo/query/fragment); it never reveals log values, and combining it
     with --show-sensitive is an error.
 
+    \b
+    Selecting sessions: `sessions --quick` lists the transcripts from their
+    first and last records without parsing them; --session ID (a prefix of
+    at least 4 characters) and --project P then restrict every command to
+    those sessions. JSON output then carries a "filter" object; the
+    configuration views add "filter_applies" and "filter_note".
+
     Global options go before the subcommand. Run `mcpeek -t <target> info`
     for a case overview, or see README.md. Exit status: 0 on success, 2 on a
-    usage error (unknown option, missing or nonexistent --target, ...).
+    usage error (unknown option, missing or nonexistent --target, a --session
+    or --project value that matches nothing or more than one, ...).
     """
     if redact and show_sensitive:
         raise click.UsageError("--redact and --show-sensitive are mutually exclusive")
@@ -130,6 +163,7 @@ def main(ctx: click.Context, target: str, home: str | None, cache_dirs: tuple[st
     ctx.obj["home"] = home
     ctx.obj["cache_dirs"] = cache_dirs
     ctx.obj["debug_files"] = debug_files
+    ctx.obj["selection"] = SessionSelection(tuple(session_values), tuple(project_values))
     ctx.obj["json"] = as_json
     ctx.obj["redact"] = redact
     ctx.obj["show_sensitive"] = show_sensitive
@@ -158,12 +192,20 @@ def _stdout_console() -> Console:
     return Console(width=int(cols) if cols.isdigit() and int(cols) > 0 else 240)
 
 
-def _load_case(ctx: click.Context) -> Case:
+def _loader(ctx: click.Context) -> TargetLoader:
     if not ctx.obj.get("target"):
         raise click.UsageError("Missing option '-t' / '--target'.")
-    loader = TargetLoader(ctx.obj["target"], cache_dirs=ctx.obj.get("cache_dirs", ()),
-                          debug_files=ctx.obj.get("debug_files", ()), home=ctx.obj.get("home"))
-    discovered = loader.discover()
+    return TargetLoader(ctx.obj["target"], cache_dirs=ctx.obj.get("cache_dirs", ()),
+                        debug_files=ctx.obj.get("debug_files", ()), home=ctx.obj.get("home"),
+                        selection=ctx.obj.get("selection"))
+
+
+def _load_case(ctx: click.Context) -> Case:
+    loader = _loader(ctx)
+    try:
+        discovered = loader.discover()
+    except SelectionError as exc:
+        raise click.UsageError(str(exc)) from None
     case = build_case(discovered, show_sensitive=ctx.obj.get("show_sensitive", False))
     if (not discovered.user_config_path and not discovered.sessions and not discovered.mcp_log_paths
             and not discovered.debug_files):
@@ -184,12 +226,17 @@ def servers(ctx: click.Context) -> None:
 
     A remote server URL recorded in the MCP log is listed as "(from MCP log)"
     when it is not the configured URL (query values withheld unless
-    --show-sensitive)."""
+    --show-sensitive). Under --session/--project the configured servers are
+    listed in full; the servers not in the current configuration and the MCP
+    log details come from the log files shown for the selected sessions, and
+    each server shows its calls in the selected sessions and the connection
+    attempts in those log files."""
     case = _load_case(ctx)
     if ctx.obj["json"]:
-        render.print_json_raw(render.servers_to_jsonable(case.servers, ctx.obj["redact"]))
+        data = render.servers_to_jsonable(case.servers, ctx.obj["redact"], case)
+        render.print_json_raw(render.with_filter(case.filter, "servers", data))
     else:
-        render.render_servers(ctx.obj["console"], case.servers, ctx.obj["redact"])
+        render.render_servers(ctx.obj["console"], case.servers, ctx.obj["redact"], case)
 
 
 @main.command(short_help="MCP tools observed being called, with call counts.")
@@ -198,20 +245,80 @@ def tools(ctx: click.Context) -> None:
     """List MCP tools observed being called, with transcript and MCP-log call counts."""
     case = _load_case(ctx)
     if ctx.obj["json"]:
-        render.print_json(case.tools, redact=ctx.obj["redact"])
+        _print_list(ctx, case, "tools", case.tools)
     else:
         render.render_tools(ctx.obj["console"], case.tools)
+        _filter_foot(ctx, case)
 
 
-@main.command(short_help="Session transcripts with basic stats.")
+def _print_list(ctx: click.Context, case: Case, key: str, items: list) -> None:
+    """A list output; under a session filter wrapped with the filter object."""
+    if case.filter is None:
+        render.print_json(items, redact=ctx.obj["redact"])
+    else:
+        render.print_json_raw(render.with_filter(case.filter, key, render.model_to_jsonable(items)),
+                              redact=ctx.obj["redact"])
+
+
+def _filter_foot(ctx: click.Context, case: Case, note: str | None = None) -> None:
+    if case.filter is not None:
+        ctx.obj["console"].print(Text(render.visible(render.filter_summary(case.filter)), style="dim"))
+        if note:
+            ctx.obj["console"].print(Text("session filter: " + note, style="dim"))
+
+
+@main.command(short_help="Session transcripts with basic stats (--quick: without parsing them).")
+@click.option(
+    "--quick",
+    is_flag=True,
+    help="List every top-level transcript without parsing it: session id, cwd and first timestamp from its first "
+    "records, last timestamp from its last records (read from the end of the file), file size and mtime, and the "
+    "number of sub-agent sidecars and spilled results (names in its companion folder). At most 8 MiB are read from "
+    "each end and lines over 1 MiB are skipped, so cwd, first or last can be '-'. Newest last activity first. Reads "
+    "no MCP log or --debug file.",
+)
+@click.option("--limit", type=click.IntRange(min=1), default=None, metavar="N",
+              help="With --quick: only the N sessions with the most recent activity (default: all).")
 @click.pass_context
-def sessions(ctx: click.Context) -> None:
-    """List session transcripts with basic stats."""
+def sessions(ctx: click.Context, quick: bool, limit: int | None) -> None:
+    """List session transcripts with basic stats.
+
+    \b
+    --quick is meant for large homes: it lists the sessions in seconds
+    without parsing any transcript; pick one and pass its id (or a prefix)
+    with --session to the other commands. The session id is the sessionId
+    of the first records (the file name when they give none; a file name
+    that differs is shown, and --session matches it too). First and last
+    are the first and last records with a timestamp; without --quick they
+    are the earliest and latest user or assistant record."""
+    if limit is not None and not quick:
+        raise click.UsageError("--limit applies to --quick only")
+    if quick:
+        _quick_sessions(ctx, limit)
+        return
     case = _load_case(ctx)
     if ctx.obj["json"]:
-        render.print_json(case.sessions, redact=ctx.obj["redact"])
+        _print_list(ctx, case, "sessions", case.sessions)
     else:
         render.render_sessions(ctx.obj["console"], case.sessions)
+        _filter_foot(ctx, case)
+
+
+def _quick_sessions(ctx: click.Context, limit: int | None) -> None:
+    try:
+        rows, flt, warnings = _loader(ctx).quick_sessions()
+    except SelectionError as exc:
+        raise click.UsageError(str(exc)) from None
+    total = len(rows)
+    if limit is not None:
+        rows = rows[:limit]
+    case_filter = session_filter(flt, quick=True) if flt is not None else None
+    if ctx.obj["json"]:
+        render.print_json_raw(render.with_filter(case_filter, "sessions", rows), redact=ctx.obj["redact"])
+    else:
+        render.render_quick_sessions(ctx.obj["console"], rows, total, case_filter)
+    for w in warnings:
+        ctx.obj["stderr_console"].print(Text.assemble(("warning:", "yellow"), " " + render.visible(w)))
 
 
 @main.command(short_help="Tool-call timeline across all sessions, in time order.")
@@ -248,9 +355,10 @@ def timeline(ctx: click.Context, all_tools: bool, mcp_only: bool, no_events: boo
     case = _load_case(ctx)
     if ctx.obj["json"]:
         rows = render.timeline_rows(case, mode, server_events=not no_events)
-        render.print_json(rows, redact=ctx.obj["redact"])
+        _print_list(ctx, case, "rows", rows)
     else:
         render.render_timeline(ctx.obj["console"], case, mode, server_events=not no_events)
+        _filter_foot(ctx, case)
 
 
 @main.command(short_help="MCP logs and --debug files, cross-check, withheld values.")
@@ -270,7 +378,10 @@ def logs(ctx: click.Context, records: bool, file_filter: str | None) -> None:
     """
     case = _load_case(ctx)
     if ctx.obj["json"]:
-        render.print_json_raw(render.logs_to_jsonable(case, records, file_filter), redact=ctx.obj["redact"])
+        data = render.logs_to_jsonable(case, records, file_filter)
+        if case.filter is not None:
+            data = {"filter": case.filter.model_dump(mode="json"), **data}
+        render.print_json_raw(data, redact=ctx.obj["redact"])
     else:
         render.render_logs(ctx.obj["console"], case, records, file_filter)
 
@@ -281,9 +392,10 @@ def credentials(ctx: click.Context) -> None:
     """List MCP OAuth client registrations (client id kind DCR or CIMD); token values are never shown."""
     case = _load_case(ctx)
     if ctx.obj["json"]:
-        render.print_json(case.oauth_clients, redact=ctx.obj["redact"])
+        _print_list(ctx, case, "oauth_clients", case.oauth_clients)
     else:
         render.render_credentials(ctx.obj["console"], case.oauth_clients, ctx.obj["redact"])
+        _filter_foot(ctx, case, render.FILTER_NOTES["oauth_clients"][1])
 
 
 @main.command(short_help="Permission grants and project .mcp.json approvals.")
@@ -297,18 +409,26 @@ def grants(ctx: click.Context) -> None:
     written with a note, not as a grant for every server."""
     case = _load_case(ctx)
     if ctx.obj["json"]:
-        render.print_json(case.grants, redact=ctx.obj["redact"])
+        _print_list(ctx, case, "grants", case.grants)
     else:
         render.render_grants(ctx.obj["console"], case.grants, case.target_root)
+        _filter_foot(ctx, case, render.FILTER_NOTES["grants"][1])
 
 
 @main.command(short_help="Case overview: HOME used, counts, warnings.")
 @click.pass_context
 def info(ctx: click.Context) -> None:
-    """Case overview: HOME used, counts, protocol versions, MCP log and debug summary, warnings."""
+    """Case overview: HOME used, counts, protocol versions, MCP log and debug summary, warnings.
+
+    Under --session/--project also the filter: the sessions selected, of how
+    many transcript files (counted by name), the MCP log and --debug files
+    kept, and the log calls and events of other sessions left out."""
     case = _load_case(ctx)
     if ctx.obj["json"]:
-        render.print_json(case, redact=ctx.obj["redact"])
+        data = render.model_to_jsonable(case)
+        if case.filter is not None:
+            data["filter"] = case.filter.model_dump(mode="json")
+        render.print_json_raw(data, redact=ctx.obj["redact"])
     else:
         render.render_info(ctx.obj["console"], case)
 

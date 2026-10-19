@@ -5,14 +5,24 @@ resolved paths -- it does not parse transcript/session content (that is
 parse.py's job). It is tolerant of missing files: a --target root that is
 missing half the tree (e.g. no --debug logs, no backups) is normal, not an
 error.
+
+Two exceptions read a little content: `sessions --quick` and the session
+filter (--session / --project) read the first and last records of each
+transcript (a bounded read, never the whole file); and once the selected
+transcripts are parsed, plan_log_files() reads the sessionId and time of
+every MCP-log record and the entry times of the --debug files to choose
+the log files that are analysed and shown for the selected sessions.
 """
 from __future__ import annotations
 
+import bisect
 import os
 import re
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
-from typing import Iterable, Optional
+from typing import Iterable, Iterator, Optional
 
 import yaml
 
@@ -112,6 +122,95 @@ class AliasFound:
 
 
 @dataclass
+class SessionSelection:
+    """The --session and --project values as given (empty: no filter)."""
+
+    sessions: tuple[str, ...] = ()
+    projects: tuple[str, ...] = ()
+
+    @property
+    def active(self) -> bool:
+        return bool(self.sessions or self.projects)
+
+
+class SelectionError(Exception):
+    """A --session or --project value that matches no session or project, or
+    more than one (a usage error)."""
+
+
+@dataclass
+class TranscriptHead:
+    """What the first records of a transcript give (a bounded read)."""
+
+    path: Path
+    project_dir: str  # encoded project folder name
+    session_id: Optional[str] = None  # first recorded "sessionId"
+    cwd: Optional[str] = None
+    first_timestamp: Optional[str] = None
+    last_session_id: Optional[str] = None  # read from the end, only when the first id is not the file name
+    last_read: bool = False
+    # the cwd is _first_cwd's (no line was skipped and the byte limit not reached before it was found)
+    cwd_exact: bool = True
+
+    @property
+    def key(self) -> str:
+        """The session id `sessions --quick` shows: the recorded id of the first records, else the file name."""
+        return self.session_id or self.path.stem
+
+    @property
+    def names(self) -> set[str]:
+        """What --session matches for this transcript: the id of its first
+        records, its file name and the id it is listed under (listed_id)."""
+        return {self.key, self.path.stem, listed_id(self)}
+
+
+def listed_id(h: TranscriptHead) -> str:
+    """The session id a full parse lists the transcript under (parse.
+    recorded_session_id), from bounded reads: the file name when the first
+    records give no id or the same one; otherwise the id of the last records
+    (a renamed copy or a resumed session keeps one id to its end), else the
+    first id."""
+    stem = h.path.stem
+    if h.session_id is None or h.session_id == stem:
+        return stem
+    if not h.last_read:
+        h.last_read = True
+        try:
+            h.last_session_id = read_transcript_tail(h.path, h.path.stat().st_size, "sessionId")
+        except OSError:
+            h.last_session_id = None
+    return h.last_session_id or h.session_id
+
+
+@dataclass
+class FilterFound:
+    """What the session filter selected and left out at discovery time."""
+
+    sessions: list[str]  # --session values as given
+    projects: list[str]  # --project values as given
+    session_ids: list[str]  # selected session ids (the ids the parsed transcripts are listed under)
+    project_dirs: list[str]  # project folders of the selected transcripts
+    transcript_files: int  # transcript files found (by name)
+    transcript_paths: list[Path] = field(default_factory=list)  # the selected ones
+    # set by plan_log_files()
+    mcp_log_files_total: int = 0
+    mcp_log_files_kept: int = 0  # shown: a selected session appears in them
+    mcp_log_files_pairing_only: int = 0
+    debug_files_total: int = 0
+    debug_files_kept: int = 0  # shown (set by the log analysis)
+    debug_files_pairing_only: int = 0
+    shown_mcp_logs: set[str] = field(default_factory=set)
+    # (path, session id from the name, first entry ms, last entry ms) of the
+    # --debug files not analysed: their cross-check scope, as unfiltered
+    extra_scopes: list[tuple[str, Optional[str], Optional[int], Optional[int]]] = field(default_factory=list)
+    # facts about the whole target that keep the joins of the selected
+    # sessions identical to an unfiltered run
+    known_session_ids: set[str] = field(default_factory=set)  # every transcript (listed_id)
+    cwd_by_session: dict[str, str] = field(default_factory=dict)  # first cwd of every transcript
+    log_sessions_by_server: dict[str, set[str]] = field(default_factory=dict)  # every MCP log file
+
+
+@dataclass
 class DiscoveredTarget:
     target_root: Path
     user_config_path: Optional[Path] = None
@@ -132,6 +231,7 @@ class DiscoveredTarget:
     skipped_links: list[SkippedLink] = field(default_factory=list)
     aliases: list[AliasFound] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    filter: Optional[FilterFound] = None  # set when --session or --project is given
 
 
 def load_manifest() -> dict:
@@ -391,6 +491,411 @@ def _first_cwd(path: Path, max_lines: int = 200) -> Optional[str]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Bounded reads for `sessions --quick` and the session filter: the first and
+# last records of a transcript, never the whole file. A line longer than
+# _LINE_MAX is skipped (read in chunks, not kept); at most _READ_MAX bytes are
+# read from either end.
+# ---------------------------------------------------------------------------
+
+_HEAD_LINES = 200
+_LINE_MAX = 1 << 20
+_READ_MAX = 8 << 20
+_TAIL_CHUNK = 64 << 10
+
+
+def _bounded_lines(f, max_lines: int = _HEAD_LINES, state: Optional[dict] = None) -> Iterator[bytes]:
+    """The first ``max_lines`` lines, at most _READ_MAX bytes in all; a line
+    over _LINE_MAX is skipped. ``state["cut"]`` becomes True once a line is
+    skipped or the read stops at the byte limit."""
+    total = 0
+    for _ in range(max_lines):
+        raw = f.readline(_LINE_MAX + 1)
+        if not raw:
+            return
+        total += len(raw)
+        if len(raw) > _LINE_MAX and not raw.endswith(b"\n"):
+            if state is not None:
+                state["cut"] = True
+            while total <= _READ_MAX:  # skip the rest of an overlong line
+                chunk = f.readline(_LINE_MAX)
+                total += len(chunk)
+                if not chunk or chunk.endswith(b"\n"):
+                    break
+        else:
+            yield raw
+        if total > _READ_MAX:
+            if state is not None:
+                state["cut"] = True
+            return
+
+
+def _record(raw: bytes) -> Optional[dict]:
+    try:
+        rec = safejson.loads(raw.decode("utf-8", errors="replace"))
+    except ValueError:
+        return None
+    return rec if isinstance(rec, dict) else None
+
+
+def _text_field(rec: dict, key: str) -> Optional[str]:
+    v = rec.get(key)
+    return v if isinstance(v, str) and v else None
+
+
+def read_transcript_head(path: Path, project_dir: str) -> TranscriptHead:
+    """sessionId, cwd and timestamp of the first records that carry them."""
+    head = TranscriptHead(path=path, project_dir=project_dir)
+    state = {"cut": False}
+    try:
+        with open(path, "rb") as f:
+            for raw in _bounded_lines(f, state=state):
+                if b'"sessionId"' not in raw and b'"cwd"' not in raw and b'"timestamp"' not in raw:
+                    continue
+                rec = _record(raw)
+                if rec is None:
+                    continue
+                head.session_id = head.session_id or _text_field(rec, "sessionId")
+                if head.cwd is None:
+                    head.cwd = _text_field(rec, "cwd")
+                    head.cwd_exact = not state["cut"]
+                head.first_timestamp = head.first_timestamp or _text_field(rec, "timestamp")
+                if head.session_id and head.cwd and head.first_timestamp:
+                    break
+    except OSError:
+        pass
+    if head.cwd is None:
+        head.cwd_exact = not state["cut"]
+    return head
+
+
+def read_transcript_tail(path: Path, size: int, key: str = "timestamp") -> Optional[str]:
+    """The ``key`` field (a non-empty string) of the last record that carries
+    one, read backwards from the end of the file in growing chunks (at most
+    _READ_MAX bytes)."""
+    needle = f'"{key}"'.encode()
+    try:
+        with open(path, "rb") as f:
+            end, chunk, done, rest = size, _TAIL_CHUNK, 0, b""
+            while end > 0 and done < _READ_MAX:
+                start = max(0, end - chunk)
+                f.seek(start)
+                data = f.read(end - start)
+                done += len(data)
+                lines = (data + rest).split(b"\n")
+                rest = lines.pop(0) if start > 0 else b""  # may start mid-line
+                for raw in reversed(lines):
+                    if needle in raw:
+                        rec = _record(raw)
+                        value = _text_field(rec, key) if rec is not None else None
+                        if value:
+                            return value
+                if len(rest) > _LINE_MAX:
+                    rest = b""  # an overlong line is not parsed
+                end = start
+                chunk = min(chunk * 2, 1 << 20)
+    except OSError:
+        return None
+    return None
+
+
+def _iso_mtime(st: os.stat_result) -> str:
+    return datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+# ---------------------------------------------------------------------------
+# Session filter: matching --session and --project values
+# ---------------------------------------------------------------------------
+
+_SHOWN_CANDIDATES = 20
+
+
+def _candidates_text(items: list[str]) -> str:
+    shown = ", ".join(items[:_SHOWN_CANDIDATES])
+    return shown + (f" and {len(items) - _SHOWN_CANDIDATES} more" if len(items) > _SHOWN_CANDIDATES else "")
+
+
+def match_project(value: str, folders: list[str]) -> str:
+    """The project folder a --project value names: the encoded folder name
+    itself, a project path on the examined host (encoded as the CLI does:
+    every character other than A-Z, a-z, 0-9 becomes "-"), or a prefix of the
+    folder name that only one folder has."""
+    from .mcplog import enc
+
+    if value in folders:
+        return value
+    if len(value) > 1 and value[-1] in "/\\":
+        value = value.rstrip("/\\") or value  # a trailing separator, in any form
+        if value in folders:
+            return value
+    encoded = enc(value)
+    if encoded in folders:
+        return encoded
+    cands = sorted(f for f in folders if f.startswith(value) or (encoded and f.startswith(encoded)))
+    if len(cands) == 1:
+        return cands[0]
+    if not cands:
+        raise SelectionError(f"--project {value!r}: no project folder matches (by folder name, project path or "
+                             f"folder-name prefix); project folders: {_candidates_text(sorted(folders)) or 'none'}")
+    raise SelectionError(f"--project {value!r} matches {len(cands)} project folders: {_candidates_text(cands)}; "
+                         "give more of the name")
+
+
+SESSION_PREFIX_MIN = 4
+
+
+def match_session(value: str, heads: list[TranscriptHead]) -> str:
+    """What a --session value names: a session id (as its first records give
+    it) or a transcript file name, or a prefix of one (at least
+    SESSION_PREFIX_MIN characters) that only one session has."""
+    if len(value) < SESSION_PREFIX_MIN:
+        raise SelectionError(f"--session {value!r}: give at least {SESSION_PREFIX_MIN} characters of a session id")
+    names = sorted({n for h in heads for n in h.names})
+    if value in names:
+        return value
+    cands = [n for n in names if n.startswith(value)]
+    if not cands:
+        raise SelectionError(f"--session {value!r}: no session id or transcript file name starts with it "
+                             f"({len(heads)} transcript(s) considered; `sessions --quick` lists the session ids)")
+    files = {c: frozenset(str(h.path) for h in heads if c in h.names) for c in cands}
+    if len(set(files.values())) == 1:  # one transcript, under its first id and its file name
+        return cands[0]
+    where = {}
+    for h in heads:
+        for n in h.names:
+            where.setdefault(n, h.project_dir)
+    raise SelectionError(f"--session {value!r} matches {len(cands)} sessions: "
+                         + _candidates_text([f"{c} ({where[c]})" for c in cands]) + "; give more of the id")
+
+
+# ---------------------------------------------------------------------------
+# Session filter: MCP log files and --debug files of the selected sessions
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _LogScan:
+    session_ids: set[str]  # every sessionId of the file (as the analysis reads them)
+    appear: set[str]  # sessions the file belongs to (the --continue leading record counted with the next)
+    effective: list[tuple[Optional[str], Optional[int]]]  # (session, ms) per record, leading record reassigned
+
+
+def scan_mcp_log_sessions(path: Path) -> _LogScan:
+    """Session ids of one MCP-log file, read as read_mcp_log reads them. The
+    leading single record of --continue (an id on no other line, followed
+    by a record of another id) belongs to the session that follows it."""
+    from .mcplog import ts_ms
+
+    recs: list[tuple[bool, Optional[str], Optional[int]]] = []  # (valid record, session, ms)
+    try:
+        data = path.read_bytes()
+    except OSError:
+        data = b""
+    for raw in data.split(b"\n"):
+        if not raw.strip():
+            continue
+        obj = _record(raw)
+        if obj is None:
+            continue
+        sid = obj.get("sessionId") if isinstance(obj.get("sessionId"), str) and obj.get("sessionId") else None
+        # the record kinds read_mcp_log reads as "debug" or "error" (else "invalid")
+        valid = ("debug" in obj and isinstance(obj["debug"], (str, int, float, bool, list, dict))) or "error" in obj
+        ts = obj.get("timestamp") if isinstance(obj.get("timestamp"), str) else None
+        recs.append((valid, sid, ts_ms(ts)))
+    good = [r for r in recs if r[0]]
+    counts = Counter(r[1] for r in good if r[1])
+    orphan: Optional[int] = None
+    if (len(good) >= 2 and good[0][1] and good[1][1] and good[0][1] != good[1][1]
+            and counts[good[0][1]] == 1):
+        orphan = next(i for i, r in enumerate(recs) if r is good[0])
+    effective = []
+    for i, (_valid, sid, ms) in enumerate(recs):
+        effective.append((good[1][1] if i == orphan else sid, ms))
+    return _LogScan(session_ids={r[1] for r in recs if r[1]}, appear={s for s, _ in effective if s},
+                    effective=effective)
+
+
+_DEBUG_MIRROR_RE = re.compile(
+    rb'^(?P<ts>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}(?:Z|[+-]\d{2}:\d{2})) (?:\[[A-Z]+\] )?'
+    rb'(?P<q>"?)MCP server \\?"(?P<server>.+?)\\?"(?:: | )')
+# the cross-check pairs a debug mirror line with MCP-log records from 5 ms
+# before to 50 ms after it (correlate.py)
+_PAIR_BEFORE_MS = -5
+_PAIR_AFTER_MS = 50
+_SPAN_SLACK_MS = 2000
+
+
+def _any_in(times: list[int], lo: int, hi: int) -> bool:
+    """A value of the sorted list lies in [lo, hi]."""
+    i = bisect.bisect_left(times, lo)
+    return i < len(times) and times[i] <= hi
+
+
+def _line_prefixes(f) -> Iterator[bytes]:
+    """The first _TAIL_CHUNK bytes of every line (without the newline),
+    whatever the line length; the rest of a longer line is skipped."""
+    while True:
+        raw = f.readline(_TAIL_CHUNK)
+        if not raw:
+            return
+        if raw.endswith(b"\n"):
+            yield raw[:-1]
+            continue
+        yield raw
+        while len(raw) == _TAIL_CHUNK:
+            raw = f.readline(_LINE_MAX)
+            if not raw or raw.endswith(b"\n"):
+                break
+
+
+def _entry_ts(prefix: bytes, levelless: bool) -> Optional[str]:
+    """Timestamp of a --debug line that starts an entry, as parse_debug_file splits the file."""
+    from .debuglog import HEADER_RE, LEVELLESS_RE
+
+    line = prefix.decode("utf-8", errors="replace")
+    m = HEADER_RE.match(line) or (LEVELLESS_RE.match(line) if levelless else None)
+    return m.group("ts") if m else None
+
+
+def debug_entry_times(dp: DebugPath) -> tuple[Optional[int], Optional[int]]:
+    """Times (ms) of the first and last entries of a --debug file, the span
+    of its cross-check scope: read from the start and backwards from the end
+    (a whole-file pass only when the last _READ_MAX bytes hold no entry)."""
+    from .mcplog import ts_ms
+
+    first = last = None
+    try:
+        size = dp.path.stat().st_size
+        with open(dp.path, "rb") as f:
+            for prefix in _line_prefixes(f):
+                first = _entry_ts(prefix, dp.allow_levelless)
+                if first:
+                    break
+            end, chunk, done, rest = size, _TAIL_CHUNK, 0, b""
+            while end > 0 and done < _READ_MAX and last is None:
+                start = max(0, end - chunk)
+                f.seek(start)
+                data = f.read(end - start)
+                done += len(data)
+                parts = (data + rest).split(b"\n")
+                rest = parts.pop(0)[:_TAIL_CHUNK] if start > 0 else b""  # starts before this chunk
+                for prefix in reversed(parts):
+                    last = _entry_ts(prefix[:_TAIL_CHUNK], dp.allow_levelless)
+                    if last:
+                        break
+                end, chunk = start, min(chunk * 2, 1 << 20)
+            if last is None and first is not None:
+                f.seek(0)
+                for prefix in _line_prefixes(f):
+                    last = _entry_ts(prefix, dp.allow_levelless) or last
+    except OSError:
+        return None, None
+    return ts_ms(first), ts_ms(last)
+
+
+def debug_mirror_times(dp: DebugPath) -> dict[str, list[int]]:
+    """Server folder -> sorted times (ms) of the mirror lines of a --debug file."""
+    from .mcplog import enc, ts_ms
+
+    out: dict[str, list[int]] = defaultdict(list)
+    try:
+        with open(dp.path, "rb") as f:
+            for prefix in _line_prefixes(f):
+                if b"MCP server " not in prefix[:80]:
+                    continue
+                m = _DEBUG_MIRROR_RE.match(prefix)
+                ms = ts_ms(m.group("ts").decode("ascii")) if m else None
+                if ms is not None:
+                    out[enc(m.group("server").decode("utf-8", errors="replace"))].append(ms)
+    except OSError:
+        pass
+    return {k: sorted(v) for k, v in out.items()}
+
+
+def _size(path: Path) -> int:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def plan_log_files(d: DiscoveredTarget, session_ids: set[str]) -> None:
+    """Session filter, once the selected transcripts are parsed: choose the
+    MCP-log and --debug files to analyse.
+
+    Shown are the MCP-log files in which a selected session appears (the
+    leading --continue record counted with the session that follows it).
+    The analysis set is closed under the cross-check pairing window: every
+    --debug file with a mirror line within -5..+50 ms of a record of an
+    analysed MCP-log file (same server folder) is analysed, and every MCP-log
+    file with a record in that window of a mirror line of an analysed --debug
+    file, until nothing is added. Within this set the pairing, the matches
+    and the debug-only lines are those of an unfiltered run; files added only
+    for the pairing are not shown. The --debug files not analysed keep their
+    cross-check scope (span and session id), so that the records "in scope"
+    are those of an unfiltered run. The debug files to show are chosen after
+    the cross-check (logevidence)."""
+    flt = d.filter
+    ids = set(session_ids)
+    scans = {str(m.path): scan_mcp_log_sessions(m.path) for m in d.mcp_log_paths}
+    by_server: dict[str, set[str]] = defaultdict(set)
+    for m in d.mcp_log_paths:
+        by_server[m.server_dir] |= scans[str(m.path)].session_ids
+    shown = {str(m.path) for m in d.mcp_log_paths if scans[str(m.path)].appear & ids}
+    logs, dbg = set(shown), {str(p.path) for p in d.debug_files if p.session_id in ids}
+    debug = {str(p.path): p for p in d.debug_files}
+    spans = {k: debug_entry_times(p) for k, p in debug.items()}
+    mirrors: dict[str, dict[str, list[int]]] = {}
+
+    def mirror_times(k: str) -> dict[str, list[int]]:
+        if k not in mirrors:
+            mirrors[k] = debug_mirror_times(debug[k])
+        return mirrors[k]
+
+    while True:
+        added = False
+        record_times: dict[str, list[int]] = defaultdict(list)
+        for m in d.mcp_log_paths:
+            if str(m.path) in logs:
+                record_times[m.server_dir] += [ms for _sid, ms in scans[str(m.path)].effective if ms is not None]
+        for v in record_times.values():
+            v.sort()
+        for k, (a, b) in spans.items():
+            if k in dbg:
+                continue
+            if a is not None and b is not None and _size(debug[k].path) > _LINE_MAX and not any(
+                    _any_in(t, min(a, b) - _SPAN_SLACK_MS, max(a, b) + _SPAN_SLACK_MS) for t in record_times.values()):
+                continue  # a large file whose time span holds no analysed record: not read whole
+            if any(_any_in(record_times.get(sd, []), ms + _PAIR_BEFORE_MS, ms + _PAIR_AFTER_MS)
+                   for sd, times in mirror_times(k).items() for ms in times):
+                dbg.add(k)
+                added = True
+        mirror_all: dict[str, list[int]] = defaultdict(list)
+        for k in dbg:
+            for sd, times in mirror_times(k).items():
+                mirror_all[sd] += times
+        for v in mirror_all.values():
+            v.sort()
+        for m in d.mcp_log_paths:
+            k, times = str(m.path), mirror_all.get(m.server_dir)
+            if k in logs or not times:
+                continue
+            if any(_any_in(times, ms - _PAIR_AFTER_MS, ms - _PAIR_BEFORE_MS)
+                   for _sid, ms in scans[k].effective if ms is not None):
+                logs.add(k)
+                added = True
+        if not added:
+            break
+    flt.mcp_log_files_total, flt.mcp_log_files_kept = len(d.mcp_log_paths), len(shown)
+    flt.mcp_log_files_pairing_only = len(logs) - len(shown)
+    flt.debug_files_total = len(d.debug_files)
+    flt.shown_mcp_logs = shown
+    flt.log_sessions_by_server = dict(by_server)
+    flt.extra_scopes = [(k, debug[k].session_id, *spans[k]) for k in debug if k not in dbg]
+    d.mcp_log_paths = [m for m in d.mcp_log_paths if str(m.path) in logs]
+    d.debug_files = [p for p in d.debug_files if str(p.path) in dbg]
+
+
 class TargetLoader:
     def __init__(
         self,
@@ -398,12 +903,15 @@ class TargetLoader:
         cache_dirs: Iterable[str | Path] = (),
         debug_files: Iterable[str | Path] = (),
         home: Optional[str] = None,
+        selection: Optional[SessionSelection] = None,
     ):
         self.target_root = Path(target_root)
         self.manifest = load_manifest()
         self.extra_cache_dirs = [Path(p) for p in cache_dirs]
         self.extra_debug_files = [Path(p) for p in debug_files]
         self.home = home
+        self.selection = selection or SessionSelection()
+        self._project_folders: list[str] = []  # transcript folders found (names)
         # Folders whose content may be read: the target root and the folders
         # the examiner named. A symlink found while scanning is followed only
         # if it resolves inside one of them.
@@ -720,15 +1228,24 @@ class TargetLoader:
 
     # -- projects ------------------------------------------------------------
 
-    def _discover_projects(self, result: DiscoveredTarget) -> None:
+    def _discover_projects(self, result: DiscoveredTarget, transcripts: list[tuple[Path, Path]],
+                           known_cwds: Optional[dict[Path, Optional[str]]] = None) -> dict[Path, str]:
+        """HOME and project folders from .claude.json and the first cwd of
+        every transcript (all of them, also under a session filter, so that
+        HOME and the project-scope files do not depend on the filter; there
+        the first-records read of the filter gives it, ``known_cwds``).
+        Returns the first cwd per transcript."""
         sources: dict[str, list[str]] = {}
+        first_cwds: dict[Path, str] = {}
         for cwd in _read_project_cwds(result.user_config_path):
             sources.setdefault(cwd, []).append(".claude.json projects")
-        for sf in result.sessions:
-            cwd = _first_cwd(sf.jsonl_path)
+        for _project_dir, jsonl_path in transcripts:
+            cwd = known_cwds[jsonl_path] if known_cwds is not None else _first_cwd(jsonl_path)
+            if cwd:
+                first_cwds[jsonl_path] = cwd
             if cwd and "transcript cwd" not in sources.setdefault(cwd, []):
                 sources[cwd].append("transcript cwd")
-        encoded = sorted({sf.project_dir_encoded for sf in result.sessions}
+        encoded = sorted({project_dir.name for project_dir, _ in transcripts}
                          | {m.encoded_cwd for m in result.mcp_log_paths})
         if self.home:
             home: Optional[str] = self.home
@@ -795,6 +1312,178 @@ class TargetLoader:
         if home is None and sources:
             result.warnings.append(f"HOME of the examined host {how}; project-scope settings.local.json and .mcp.json "
                                    "were not looked up (give HOME with --home)")
+        return first_cwds
+
+    # -- transcripts -----------------------------------------------------------
+
+    def _sessions_root(self, result: DiscoveredTarget) -> Optional[Path]:
+        """The transcript folder, if it can be read (else reported)."""
+        se = _manifest_entry(self.manifest, "sessions")
+        sessions_root = self.target_root / se["path"]
+        if sessions_root.is_dir() and self.readable(result, sessions_root, "transcript folder"):
+            return sessions_root
+        if not sessions_root.is_dir() and not self._behind_skipped_link(sessions_root):
+            result.warnings.append(f"no sessions directory at {sessions_root}")
+        return None
+
+    def _transcripts(self, result: DiscoveredTarget, sessions_root: Path) -> Iterator[tuple[Path, Path]]:
+        """(project folder, transcript) for every top-level transcript, with
+        the symlink and alias rules applied. A generator: the caller handles
+        each transcript before the next project folder is listed."""
+        self._project_folders = []
+        project_dirs = [p for p in sorted(sessions_root.iterdir())
+                        if p.is_dir() and self.readable(result, p, "transcript folder")]
+        for project_dir in self._unique(result, project_dirs, "transcript folder"):
+            self._project_folders.append(project_dir.name)
+            jsonls = [j for j in sorted(project_dir.glob("*.jsonl"))
+                      if j.is_file() and self.readable(result, j, "session transcript")]
+            for jsonl_path in self._unique(result, jsonls, "session transcript"):
+                yield project_dir, jsonl_path
+
+    def _session_files(self, result: DiscoveredTarget, project_dir: Path, jsonl_path: Path) -> SessionFiles:
+        session_uuid = jsonl_path.stem
+        companion_dir = project_dir / session_uuid
+        subagent_dir = companion_dir / "subagents"
+        tool_results_dir = companion_dir / "tool-results"
+        sf = SessionFiles(
+            session_uuid=session_uuid,
+            project_dir_encoded=project_dir.name,
+            jsonl_path=jsonl_path,
+            subagent_dir=subagent_dir if (subagent_dir.is_dir() and self.readable(
+                result, subagent_dir, "sub-agent folder") and self._first_visit(
+                result, subagent_dir, "sub-agent folder")) else None,
+            tool_results_dir=tool_results_dir if (tool_results_dir.is_dir() and self.readable(
+                result, tool_results_dir, "spilled tool results folder")) else None,
+        )
+        if sf.subagent_dir is not None:
+            files = []
+            for f in sorted(sf.subagent_dir.iterdir()):
+                if f.is_symlink() and not self.readable(result, f, "sub-agent file"):
+                    sf.skip_names.add(f.name)
+                else:
+                    files.append(f)
+            kept = set(self._unique(result, files, "sub-agent file"))
+            sf.skip_names.update(f.name for f in files if f not in kept)
+        return sf
+
+    def _other_config_dirs(self, result: DiscoveredTarget) -> None:
+        """Transcripts of another config folder (a relocated CLAUDE_CONFIG_DIR)
+        are not read: say where they are."""
+        se = _manifest_entry(self.manifest, "sessions")
+        for cfg_dir in sorted(self.target_root.glob(".claude?*")):
+            if cfg_dir.name == ".claude" or not cfg_dir.is_dir():
+                continue
+            other = cfg_dir / se["path"].split("/", 1)[-1]
+            if other.is_dir() and self._inside(other):
+                result.warnings.append(f"{other}: transcript folder of a config folder other than .claude "
+                                       "(for example a relocated CLAUDE_CONFIG_DIR); not read (see README, Scope "
+                                       "and limitations)")
+            other_cfg = cfg_dir / ".claude.json"
+            if other_cfg.is_file() and self._inside(other_cfg):
+                result.warnings.append(f"{other_cfg}: .claude.json of a config folder other than .claude "
+                                       "(for example a relocated CLAUDE_CONFIG_DIR); not read (see README, Scope "
+                                       "and limitations)")
+
+    # -- session filter ----------------------------------------------------------
+
+    def _select(self, found: list[tuple[Path, Path]]) -> tuple[list[TranscriptHead], list[TranscriptHead]]:
+        """(heads of all transcripts, heads of the selected ones). A --session
+        value matches the session id the first records give (the id
+        `sessions --quick` shows) or the transcript file name; --project
+        narrows the transcripts a --session value is matched against. Every
+        transcript listed under the same session id (listed_id) is selected
+        too, a copy in another project folder for example, so the joins of
+        that session do not depend on the filter. Raises SelectionError."""
+        sel = self.selection
+        heads = [read_transcript_head(j, p.name) for p, j in found]
+        pool = heads
+        if sel.projects:
+            folders = list(self._project_folders)
+            chosen = {match_project(v, folders) for v in sel.projects}
+            pool = [h for h in heads if h.project_dir in chosen]
+            if not pool:
+                raise SelectionError(f"--project: no session transcript in {', '.join(sorted(chosen))}")
+        if sel.sessions:
+            if not pool:
+                raise SelectionError("--session: no session transcript found under the target root")
+            names = {match_session(v, pool) for v in sel.sessions}
+            picked = [h for h in pool if h.names & names]
+        else:
+            picked = list(pool)
+        ids = {listed_id(h) for h in picked}
+        paths = {h.path for h in picked}
+        return heads, [h for h in heads if h.path in paths or listed_id(h) in ids]
+
+    def _filter_found(self, found: list, heads: list[TranscriptHead], chosen: list[TranscriptHead]) -> FilterFound:
+        return FilterFound(
+            sessions=list(self.selection.sessions), projects=list(self.selection.projects),
+            session_ids=sorted({listed_id(h) for h in chosen}), project_dirs=sorted({h.project_dir for h in chosen}),
+            transcript_files=len(found), transcript_paths=[h.path for h in chosen],
+            # the selected transcripts add the ids their full parse gives (build_case)
+            known_session_ids={listed_id(h) for h in heads if h not in chosen})
+
+    def quick_sessions(self) -> tuple[list[dict], Optional[FilterFound], list[str]]:
+        """`sessions --quick`: one row per top-level transcript from its size,
+        mtime, first and last records and the names in its companion
+        folder, newest last activity first. Returns (rows, filter, warnings).
+        Raises SelectionError."""
+        from .mcplog import ts_ms
+
+        result = DiscoveredTarget(target_root=self.target_root)
+        if not self.target_root.is_dir():
+            result.warnings.append(f"target root does not exist or is not a directory: {self.target_root}")
+            return [], None, result.warnings
+        claude_dir = self.target_root / ".claude"
+        if claude_dir.is_symlink():
+            self.readable(result, claude_dir, ".claude folder (transcripts, credentials, settings, backups, "
+                                              "--debug files)")
+        sessions_root = self._sessions_root(result)
+        found = list(self._transcripts(result, sessions_root)) if sessions_root is not None else []
+        self._other_config_dirs(result)
+        flt = None
+        if self.selection.active:
+            heads, chosen = self._select(found)
+            flt = self._filter_found(found, heads, chosen)
+        else:
+            chosen = [read_transcript_head(j, p.name) for p, j in found]
+        rows = []
+        for h in chosen:
+            try:
+                st = h.path.stat()
+            except OSError:
+                continue
+            companion = h.path.parent / h.path.stem
+            last = read_transcript_tail(h.path, st.st_size)
+            last_ms = ts_ms(last)
+            order = last_ms if last_ms is not None else st.st_mtime_ns // 1_000_000  # no timestamp: the mtime
+            rows.append((-order, str(h.path), {
+                "session_id": h.key,
+                "file_name_differs": h.session_id is not None and h.session_id != h.path.stem,
+                "project_dir": h.project_dir,
+                "cwd": h.cwd,
+                "first_timestamp": h.first_timestamp,
+                "last_timestamp": last,
+                "size_bytes": st.st_size,
+                "mtime": _iso_mtime(st),
+                "subagent_sidecars": self._count_names(result, companion / "subagents", "sub-agent folder",
+                                                       lambda n: n.startswith("agent-") and n.endswith(".meta.json")),
+                "spilled_results": self._count_names(result, companion / "tool-results",
+                                                     "spilled tool results folder", lambda n: True),
+                "transcript_path": str(h.path),
+            }))
+        rows.sort(key=lambda r: r[:2])
+        return [r[2] for r in rows], flt, result.warnings
+
+    def _count_names(self, result: DiscoveredTarget, folder: Path, what: str, want) -> Optional[int]:
+        """Entries of a companion folder that match ``want`` (names only, no
+        file is opened); None if the folder is absent or leaves the target."""
+        if not folder.is_dir() or not self.readable(result, folder, what):
+            return None
+        try:
+            return sum(1 for f in folder.iterdir()
+                       if want(f.name) and not (f.is_symlink() and not self._inside(f)))
+        except OSError:
+            return None
 
     def discover(self) -> DiscoveredTarget:
         root = self.target_root
@@ -837,57 +1526,24 @@ class TargetLoader:
         result.user_grants_path = self._file(result, gp, "user settings.local.json",
                                              f"no user-scope settings.local.json found at {gp}")
 
-        # sessions (two on-disk shapes, merged per session_uuid)
-        se = _manifest_entry(self.manifest, "sessions")
-        sessions_root = root / se["path"]
-        if sessions_root.is_dir() and self.readable(result, sessions_root, "transcript folder"):
-            project_dirs = [p for p in sorted(sessions_root.iterdir())
-                            if p.is_dir() and self.readable(result, p, "transcript folder")]
-            for project_dir in self._unique(result, project_dirs, "transcript folder"):
-                jsonls = [j for j in sorted(project_dir.glob("*.jsonl"))
-                          if j.is_file() and self.readable(result, j, "session transcript")]
-                for jsonl_path in self._unique(result, jsonls, "session transcript"):
-                    session_uuid = jsonl_path.stem
-                    companion_dir = project_dir / session_uuid
-                    subagent_dir = companion_dir / "subagents"
-                    tool_results_dir = companion_dir / "tool-results"
-                    sf = SessionFiles(
-                        session_uuid=session_uuid,
-                        project_dir_encoded=project_dir.name,
-                        jsonl_path=jsonl_path,
-                        subagent_dir=subagent_dir if (subagent_dir.is_dir() and self.readable(
-                            result, subagent_dir, "sub-agent folder") and self._first_visit(
-                            result, subagent_dir, "sub-agent folder")) else None,
-                        tool_results_dir=tool_results_dir if (tool_results_dir.is_dir() and self.readable(
-                            result, tool_results_dir, "spilled tool results folder")) else None,
-                    )
-                    if sf.subagent_dir is not None:
-                        files = []
-                        for f in sorted(sf.subagent_dir.iterdir()):
-                            if f.is_symlink() and not self.readable(result, f, "sub-agent file"):
-                                sf.skip_names.add(f.name)
-                            else:
-                                files.append(f)
-                        kept = set(self._unique(result, files, "sub-agent file"))
-                        sf.skip_names.update(f.name for f in files if f not in kept)
-                    result.sessions.append(sf)
-        elif not sessions_root.is_dir() and not self._behind_skipped_link(sessions_root):
-            result.warnings.append(f"no sessions directory at {sessions_root}")
-        # transcripts of another config folder (a relocated CLAUDE_CONFIG_DIR)
-        # are not read: say where they are
-        for cfg_dir in sorted(root.glob(".claude?*")):
-            if cfg_dir.name == ".claude" or not cfg_dir.is_dir():
-                continue
-            other = cfg_dir / se["path"].split("/", 1)[-1]
-            if other.is_dir() and self._inside(other):
-                result.warnings.append(f"{other}: transcript folder of a config folder other than .claude "
-                                       "(for example a relocated CLAUDE_CONFIG_DIR); not read (see README, Scope "
-                                       "and limitations)")
-            other_cfg = cfg_dir / ".claude.json"
-            if other_cfg.is_file() and self._inside(other_cfg):
-                result.warnings.append(f"{other_cfg}: .claude.json of a config folder other than .claude "
-                                       "(for example a relocated CLAUDE_CONFIG_DIR); not read (see README, Scope "
-                                       "and limitations)")
+        # sessions (two on-disk shapes, merged per session_uuid). Under a
+        # session filter only the selected transcripts and their companion
+        # folders are opened (the others: their first records only).
+        sessions_root = self._sessions_root(result)
+        found: list[tuple[Path, Path]] = []
+        for project_dir, jsonl_path in (self._transcripts(result, sessions_root) if sessions_root is not None else ()):
+            found.append((project_dir, jsonl_path))
+            if not self.selection.active:
+                result.sessions.append(self._session_files(result, project_dir, jsonl_path))
+        heads: list[TranscriptHead] = []
+        if self.selection.active:
+            heads, chosen = self._select(found)
+            picked = {h.path for h in chosen}
+            for project_dir, jsonl_path in found:
+                if jsonl_path in picked:
+                    result.sessions.append(self._session_files(result, project_dir, jsonl_path))
+            result.filter = self._filter_found(found, heads, chosen)
+        self._other_config_dirs(result)
 
         # debug logs (default folder, then any --debug-file paths)
         dl = _manifest_entry(self.manifest, "debug_logs")
@@ -913,5 +1569,15 @@ class TargetLoader:
             )
 
         # HOME of the examined host, project folders and their project-scope files
-        self._discover_projects(result)
+        # under a filter the first-records read gives the cwd; a transcript
+        # for which that bounded read skipped a line or reached its byte limit
+        # before a cwd is read as without a filter (_first_cwd)
+        first_cwds = self._discover_projects(
+            result, found, {h.path: h.cwd if h.cwd_exact else _first_cwd(h.path) for h in heads} if heads else None)
+        if result.filter is not None:
+            # the MCP-log and --debug files follow the parsed sessions (plan_log_files, called by build_case)
+            for h in heads:
+                cwd = first_cwds.get(h.path)
+                if cwd:
+                    result.filter.cwd_by_session.setdefault(listed_id(h), cwd)
         return result

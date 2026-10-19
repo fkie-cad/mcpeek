@@ -5,7 +5,11 @@ counted once) -> parse MCP logs -> cross-check debug mirror lines against
 MCP-log records -> analyse MCP-log streams and debug mirror streams (debug
 items whose anchor record has an MCP-log twin are dropped, the rest is kept
 as debug-only evidence) -> pin calls by toolUseId -> join calls to
-transcripts -> per-server summaries.
+transcripts -> per-server summaries. Under a session filter the analysis
+runs on the files loader.plan_log_files() chose (closed under the debug
+pairing window), the summaries cover the files shown, and the output keeps
+the calls, events, records and cross-check of the selected sessions (the
+rest is counted per file).
 """
 from __future__ import annotations
 
@@ -26,6 +30,7 @@ from .mcplog import (
     analyze_stream,
     enc,
     hc,
+    mask_rec,
     output_fields,
     read_mcp_log,
     retry_dispatch_note,
@@ -36,6 +41,7 @@ from .models import (
     CrossCheck,
     DebugFile,
     DebugServerInfo,
+    FilteredFile,
     LatestLink,
     LogCall,
     LogServerSummary,
@@ -226,6 +232,7 @@ class LogEvidence:
     cross_check: Optional[CrossCheck] = None
     debug_server_infos: list[DebugServerInfo] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    filtered_out: list[FilteredFile] = field(default_factory=list)  # session filter: left out, per file
 
 
 def build_log_evidence(discovered: DiscoveredTarget, servers: list[Server], sessions: list[Session],
@@ -280,17 +287,32 @@ def build_log_evidence(discovered: DiscoveredTarget, servers: list[Server], sess
                                         log_files=roots_count.get(str(cr.path), 0)))
 
     # --- cross-check --------------------------------------------------------------
+    flt = discovered.filter
+    ids: set[str] = set(flt.session_ids) if flt is not None else set()
+    eff = _effective_sessions(log_streams) if flt is not None else {}
+    if flt is not None and policy.show:
+        # session filter: the values of other sessions' records stay withheld,
+        # also with --show-sensitive (in the text of the rows kept from them)
+        withhold = SensitivePolicy(show=False)
+        for _, recs in log_streams:
+            for r in recs:
+                if eff.get(id(r)) not in ids and eff.get(id(r)) is not None:
+                    mask_rec(r, withhold)
     all_log_recs = [r for _, recs in log_streams for r in recs]
     debug_recs = [r for p in parsed_debug for r in p.mirror_recs]
     # scope of each debug file: its session id (from the name) and its own time span
     scopes = [DebugScope(p.info.path, p.info.session_id, ts_ms(p.info.first_timestamp), ts_ms(p.info.last_timestamp))
               for p in parsed_debug]
+    if flt is not None:
+        # session filter: the debug files not analysed keep their scope (loader.plan_log_files)
+        scopes += [DebugScope(path, sid, first, last) for path, sid, first, last in flt.extra_scopes]
     context = []
     for p in parsed_debug:
         for path in p.info.log_batches_dropped:
             context.append(f"{p.info.path}: 'Dropping log batch for {path}' (MCP-log write failed)")
-    if parsed_debug:
+    if parsed_debug or (flt is not None and flt.extra_scopes):
         ev.cross_check = cross_check(all_log_recs, debug_recs, scopes, policy, context)
+    pair_session = {id(d): d.session_id for d in debug_recs}  # the debug-side session id the pairing used
     # session id of debug files without one in the name, from matched records
     for p in parsed_debug:
         if p.info.session_id is None:
@@ -303,9 +325,27 @@ def build_log_evidence(discovered: DiscoveredTarget, servers: list[Server], sess
             elif len(sids) > 1:
                 p.info.session_id_source = "matched MCP log records (several: " + ", ".join(sids) + ")"
 
+    # --- session filter: the files shown ----------------------------------------------------
+    # The MCP-log files in which a selected session appears, and the debug
+    # files named after a selected session or paired with its records; the
+    # other analysed files only complete the pairing (loader.plan_log_files).
+    shown: Optional[set[str]] = None
+    if flt is not None:
+        shown = set(flt.shown_mcp_logs)
+        for p in parsed_debug:
+            if p.info.session_id in ids or any(r.xref is not None and eff.get(id(r.xref)) in ids for r in p.mirror_recs):
+                shown.add(p.info.path)
+
     # --- transcripts: sessions, cwd hints --------------------------------------------------
+    # Under a session filter only the selected transcripts are parsed; the
+    # session ids and first cwd of the others come from their first records,
+    # so that notes and joins of the selected sessions stay as unfiltered.
     transcript_sessions = {s.session_uuid for s in sessions}
     cwd_by_session = {s.session_uuid: sorted(s.cwds)[0] for s in sessions if s.cwds}
+    if flt is not None:
+        transcript_sessions |= flt.known_session_ids
+        for sid, cwd in flt.cwd_by_session.items():
+            cwd_by_session.setdefault(sid, cwd)
     for p in parsed_debug:
         if p.info.session_id:
             p.info.has_transcript = p.info.session_id in transcript_sessions
@@ -354,6 +394,8 @@ def build_log_evidence(discovered: DiscoveredTarget, servers: list[Server], sess
             stream_meta[id(x)] = (info.server_dir, info.encoded_cwd, info.path)
         built_calls += calls
         built_events += events
+        if shown is not None and info.path not in shown:
+            continue  # analysed for the pairing only: not in the per-server summaries
         key = (info.encoded_cwd, info.server_dir)
         error_counts[key] += sum(1 for r in recs if r.key == "error")
         stderr_counts[key] += sum(1 for r in recs if r.category == "stderr")
@@ -409,10 +451,13 @@ def build_log_evidence(discovered: DiscoveredTarget, servers: list[Server], sess
                     continue
                 stream_meta[id(be)] = (be.model.server_dir, enc(cwd_hint) if cwd_hint else None, p.info.path)
                 built_events.append(be)
+            if shown is not None and p.info.path not in shown:
+                continue
             key = (enc(cwd_hint) if cwd_hint else None, recs[0].server_dir)
             error_counts[key] += sum(1 for r in recs if r.key == "error" and r.xref is None)
             stderr_counts[key] += sum(1 for r in recs if r.category == "stderr" and r.xref is None)
-        ev.debug_server_infos += p.server_infos
+        if shown is None or p.info.path in shown:
+            ev.debug_server_infos += p.server_infos
         ev.debug_files.append(p.info)
 
     # debug-file events that add evidence to the timeline
@@ -456,6 +501,9 @@ def build_log_evidence(discovered: DiscoveredTarget, servers: list[Server], sess
         for r in p.mirror_recs:
             if r.session_id:
                 log_sessions_by_server[r.server_dir].add(r.session_id)
+    if flt is not None:
+        for sd, sids in flt.log_sessions_by_server.items():
+            log_sessions_by_server[sd] |= sids
     join_calls(built_calls, tool_calls, transcript_sessions, log_sessions_by_server)
 
     ev.log_calls = [bc.model for bc in built_calls]
@@ -490,6 +538,8 @@ def build_log_evidence(discovered: DiscoveredTarget, servers: list[Server], sess
 
     for be in built_events:
         sd, ecwd, fpath = stream_meta.get(id(be), (be.model.server_dir, None, be.model.source))
+        if shown is not None and fpath not in shown:
+            continue
         s = summ((ecwd, sd), be.model.server, be.model.server_candidates)
         m = be.model
         touch(s, m.timestamp, fpath, m.source_kind, m.cwd)
@@ -525,6 +575,8 @@ def build_log_evidence(discovered: DiscoveredTarget, servers: list[Server], sess
             s.shutdowns += 1
     for bc in built_calls:
         sd, ecwd, fpath = stream_meta.get(id(bc), (bc.model.server_dir, None, bc.model.source))
+        if shown is not None and fpath not in shown:
+            continue
         s = summ((ecwd, sd), bc.model.server, bc.model.server_candidates)
         touch(s, bc.model.start_timestamp, fpath, bc.model.source_kind, bc.model.cwd)
         seen(s, bc.model.end_timestamp)
@@ -541,7 +593,7 @@ def build_log_evidence(discovered: DiscoveredTarget, servers: list[Server], sess
             summaries[key].stderr_records += n
     for info, recs in log_streams:
         s = summaries.get((info.encoded_cwd, info.server_dir))
-        if s is None:
+        if s is None or (shown is not None and info.path not in shown):
             continue
         if info.possibly_shared:
             s.possibly_shared = True
@@ -564,4 +616,175 @@ def build_log_evidence(discovered: DiscoveredTarget, servers: list[Server], sess
                         if u not in srv.log_urls_matching_url and all(rec == srv.url for d, rec in pairs if d == u):
                             srv.log_urls_matching_url.append(u)
     ev.summaries = sorted(summaries.values(), key=lambda s: (s.encoded_cwd or "", s.server_dir))
+    if flt is not None:
+        _leave_out_other_sessions(ev, ids, shown, eff, log_streams, parsed_debug)
+        if ev.cross_check is not None:
+            ev.cross_check = _restrict_cross_check(ev.cross_check, all_log_recs, debug_recs, ids, eff, pair_session,
+                                                   {f.path for f in ev.debug_files})
+        flt.debug_files_kept = len(ev.debug_files)
+        flt.debug_files_pairing_only = len(parsed_debug) - len(ev.debug_files)
     return ev
+
+
+def _effective_sessions(log_streams) -> dict[int, Optional[str]]:
+    """id(MCP-log record) -> the session it belongs to: its sessionId; the
+    leading --continue record belongs to the session of the next record."""
+    out: dict[int, Optional[str]] = {}
+    for info, recs in log_streams:
+        good = [r for r in recs if r.key != "invalid"]
+        lead = good[0] if info.leading_single_record_session and len(good) > 1 else None
+        for r in recs:
+            out[id(r)] = good[1].session_id if r is lead else r.session_id
+    return out
+
+
+# Server events that describe the server process (its connection, transport,
+# configuration and shutdown) rather than one session's activity. Under a
+# session filter they are kept from every kept file, whichever session id
+# their records carry (a /clear switch changes it within one process); the
+# other events are kept for the selected sessions only.
+PROCESS_EVENTS = frozenset({
+    "connect", "shutdown", "transport-error", "session-switch", "reconnect", "list-changed", "capabilities",
+    "stderr", "transport", "connection", "oauth", "config", "channel", "discovery-cache", "skills", "tool-schema",
+})
+
+
+def _leave_out_other_sessions(ev: LogEvidence, ids: set[str], shown: set[str], eff: dict[int, Optional[str]],
+                              log_streams, parsed_debug) -> None:
+    """Session filter: keep the log calls of the selected sessions, their
+    events and the server process events of the files shown; list only the
+    shown files, and in them only the records of the selected sessions and
+    records without a session id (MCP logs) and the entries of the selected
+    sessions (debug files). The rows kept carry no withheld value of
+    another session's record (their text shows it withheld, see
+    build_log_evidence). Everything else is left out and counted per file;
+    of a file read for the pairing only all records are counted. The
+    per-server summaries cover the shown files as a whole."""
+    per_file: dict[str, FilteredFile] = {}
+    own = {p.info.path: p.info.session_id for p in parsed_debug}  # a debug file's session (name or matched)
+
+    def left_out(path: str, sid: Optional[str], what: str, n: int = 1) -> None:
+        f = per_file.setdefault(path, FilteredFile(path=path, pairing_only=path not in shown))
+        setattr(f, what, getattr(f, what) + n)
+        if (sid or "") not in f.session_ids:
+            f.session_ids.append(sid or "")
+
+    calls = []
+    for lc in ev.log_calls:
+        if lc.session_id in ids:
+            calls.append(lc)
+        else:
+            left_out(lc.source.rpartition(":")[0] or lc.source, lc.session_id, "log_calls")
+    # the session a record belongs to, by the source of its withheld values
+    record_session: dict[str, Optional[str]] = {}
+    for _info, recs in log_streams:
+        for r in recs:
+            record_session[r.source] = eff.get(id(r))
+    for p in parsed_debug:
+        for r in p.mirror_recs:
+            record_session[r.source] = eff.get(id(r.xref)) if r.xref is not None else r.session_id
+    events = []
+    for e in ev.events:
+        path = e.source.rpartition(":")[0] or e.source
+        process = e.event in PROCESS_EVENTS and path in shown and (path not in own or own[path] in ids)
+        if e.session_uuid in ids or process:
+            kept = []
+            for item in e.sensitive:
+                sid = record_session.get(item.source)
+                if sid is None or sid in ids:
+                    kept.append(item)
+                else:
+                    left_out(item.source.rpartition(":")[0] or item.source, sid, "sensitive_items")
+            e.sensitive = kept
+            events.append(e)
+        else:
+            left_out(path, e.session_uuid, "server_events")
+    ev.log_calls, ev.events = calls, events
+
+    for info, recs in log_streams:
+        if info.path not in shown:
+            for r in recs:
+                left_out(info.path, eff.get(id(r)), "records")
+            continue
+        keep = [eff.get(id(r)) in ids or eff.get(id(r)) is None for r in recs]
+        for r, k in zip(recs, keep):
+            if not k:
+                left_out(info.path, eff.get(id(r)), "records")
+        info.entries = [x for x, k in zip(info.entries, keep) if k]
+    for p in parsed_debug:
+        if p.info.path not in shown:
+            if p.info.mcp_entries:
+                left_out(p.info.path, own.get(p.info.path), "records", len(p.info.mcp_entries))
+            continue
+        by_line = {r.line: r for r in p.mirror_recs}
+        entries = []
+        for x in p.info.mcp_entries:
+            r = by_line.get(x.line) if x.mirror else None
+            if r is not None:
+                sid = eff.get(id(r.xref)) if r.xref is not None else r.session_id
+            else:
+                sid = own.get(p.info.path)
+            if sid in ids:
+                entries.append(x)
+            else:
+                left_out(p.info.path, sid, "records")
+        p.info.mcp_entries = entries
+
+    ev.mcp_log_files = [f for f in ev.mcp_log_files if f.path in shown]
+    ev.debug_files = [f for f in ev.debug_files if f.path in shown]
+    names = {f.path for f in ev.debug_files}
+    ev.latest_links = [x for x in ev.latest_links
+                       if x.path in names or x.resolves_to in names or x.identical_to in names]
+    for cr in ev.cache_roots:
+        cr.log_files = sum(1 for f in ev.mcp_log_files if f.cache_root == cr.path)
+    for f in per_file.values():
+        f.session_ids.sort()
+    ev.filtered_out = sorted(per_file.values(), key=lambda f: (f.pairing_only, f.path))
+
+
+def _restrict_cross_check(cc: CrossCheck, log_recs: list[Rec], debug_recs: list[Rec], ids: set[str],
+                          eff: dict[int, Optional[str]], pair_session: dict[int, Optional[str]],
+                          debug_paths: set[str]) -> CrossCheck:
+    """The cross-check of the selected sessions: the MCP-log records of a
+    selected session in scope, the mirror lines paired with them, and the
+    unpaired mirror lines of a selected session's debug file. The pairing
+    itself is that of the whole analysed set (an unfiltered run's)."""
+    def mine(d: Rec) -> bool:
+        return eff.get(id(d.xref)) in ids if d.xref is not None else d.session_id in ids
+
+    sel_r = [r for r in log_recs if r.xref_status is not None and eff.get(id(r)) in ids]
+    sel_d = [d for d in debug_recs if mine(d)]
+    out = CrossCheck(debug_files=len(debug_paths), debug_mirror_lines=len(sel_d),
+                     mcp_log_records_in_scope=len(sel_r),
+                     context=[c for c in cc.context if c.split(": ", 1)[0] in debug_paths])
+    offsets: Counter = Counter()
+    last: dict[tuple[str, str], int] = {}
+    for d in sel_d:
+        r = d.xref
+        if r is None:
+            out.debug_only += 1
+            continue
+        out.matched += 1
+        if d.xref_status == "identical":
+            out.identical += 1
+        elif d.xref_status == "redaction-only":
+            out.redaction_only += 1
+        elif d.xref_status == "error-object":
+            out.error_object += 1
+        else:
+            out.differs += 1
+        if r.ts is not None and d.ts is not None:
+            offsets[r.ts - d.ts] += 1
+        if pair_session.get(id(d)) and r.session_id and pair_session.get(id(d)) != r.session_id:
+            out.session_mismatches += 1
+        k = (d.stream, r.source_path)
+        if k in last and r.line < last[k]:
+            out.order_inversions += 1
+        last[k] = max(last.get(k, 0), r.line)
+    out.mcp_log_only = sum(1 for r in sel_r if r.xref_status == "mcp-log only")
+    out.offset_histogram_ms = {str(k): v for k, v in sorted(offsets.items())}
+    out.offsets_outside_0_5ms = sum(v for k, v in offsets.items() if not 0 <= k <= 5)
+    rsrc, dsrc = {r.source for r in sel_r}, {d.source for d in sel_d}
+    out.items = [it for it in cc.items
+                 if (it.mcp_log_source in rsrc if it.mcp_log_source else it.debug_source in dsrc)]
+    return out

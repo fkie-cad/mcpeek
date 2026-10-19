@@ -22,6 +22,7 @@ import html
 import json
 import re
 import shlex
+from pathlib import PurePath
 from typing import Any, Iterable, Optional
 
 from pydantic import BaseModel
@@ -236,13 +237,130 @@ def print_json_raw(data: Any, redact: bool = False) -> None:
     print(json.dumps(data, indent=2, sort_keys=False, default=str))
 
 
-def servers_to_jsonable(servers, redact: bool) -> list[dict]:
+# ---------------------------------------------------------------------------
+# Session filter (--session / --project): JSON wrapping and text lines
+# ---------------------------------------------------------------------------
+
+# How a session filter applies to the configuration views: (applies, note)
+FILTER_NOTES = {
+    "servers": (True, "the configured servers (user scope, project scope, project .mcp.json) are listed in full, as "
+                      "without the filter; the rows of servers not in the current configuration and the MCP log "
+                      "details of every row (log_info) come from the MCP-log and --debug files shown for the "
+                      "selected sessions; selected_sessions gives each server's calls in the selected sessions and "
+                      "the connection attempts in the MCP-log files shown for them (of whichever session id)"),
+    "oauth_clients": (False, "OAuth client registrations are configuration, not per session: listed in full"),
+    "grants": (False, "permission grants and project .mcp.json approvals are configuration, not per session: "
+                      "listed in full"),
+}
+
+
+def with_filter(case_filter, key: str, data: Any) -> Any:
+    """Under a session filter, a list output becomes {"filter": ..., <key>: list};
+    the configuration views also carry "filter_applies" and "filter_note".
+    Without a filter the output is unchanged."""
+    if case_filter is None:
+        return data
+    out: dict[str, Any] = {"filter": case_filter.model_dump(mode="json")}
+    if key in FILTER_NOTES:
+        out["filter_applies"], out["filter_note"] = FILTER_NOTES[key]
+    out[key] = data
+    return out
+
+
+def _ids_text(ids: list[str], limit: int = 5) -> str:
+    shown = ", ".join(ids[:limit])
+    return shown + (f" and {len(ids) - limit} more" if len(ids) > limit else "")
+
+
+def filter_lines(f) -> list[tuple[str, str]]:
+    """(label, text) rows describing an active session filter."""
+    given = "; ".join([f"--session {v}" for v in f.session_values] + [f"--project {v}" for v in f.project_values])
+    rows = [("Session filter", f"{given} -> {len(f.session_ids)} session(s): {_ids_text(f.session_ids)}; "
+                               f"{f.transcript_files_selected} of {f.transcript_files_total} transcript file(s) "
+                               "(counted by file name)")]
+    if f.mcp_log_files_total is not None:
+        pairing = ""
+        if f.mcp_log_files_pairing_only or f.debug_files_pairing_only:
+            pairing = (f"; read for the pairing only, not shown: {f.mcp_log_files_pairing_only} MCP log and "
+                       f"{f.debug_files_pairing_only} --debug file(s)")
+        rows.append(("Shown by the filter", f"MCP log files {f.mcp_log_files_kept} of {f.mcp_log_files_total}; "
+                                            f"--debug files {f.debug_files_kept} of {f.debug_files_total}{pairing}"))
+        others = sorted({s for x in f.filtered_out_by_file for s in x.session_ids})
+        text = (f"{f.log_calls_filtered_out} log call(s), {f.server_events_filtered_out} server event(s), "
+                f"{f.records_filtered_out} log record(s) and {f.sensitive_items_filtered_out} withheld value(s) "
+                "of other sessions")
+        if others:
+            text += " (" + _ids_text([s or "no session id" for s in others]) + ")"
+        rows.append(("Left out by the filter", text))
+    return rows
+
+
+def filter_summary(f) -> str:
+    """One line for the foot of a filtered view."""
+    text = (f"session filter: {len(f.session_ids)} session(s) ({_ids_text(f.session_ids, 3)}), "
+            f"{f.transcript_files_selected} of {f.transcript_files_total} transcript file(s)")
+    if f.mcp_log_files_total is not None:
+        text += (f"; MCP log files {f.mcp_log_files_kept} of {f.mcp_log_files_total}, --debug files "
+                 f"{f.debug_files_kept} of {f.debug_files_total}; left out: {f.log_calls_filtered_out} log "
+                 f"call(s), {f.server_events_filtered_out} server event(s), {f.records_filtered_out} log record(s) "
+                 "of other sessions (see `info`)")
+    return text
+
+
+def left_out_text(x, root: Optional[str]) -> str:
+    what = "read for the pairing only, not shown" if x.pairing_only else "left out"
+    return (f"{_rel(x.path, root)}: {what}: {x.log_calls} log call(s), {x.server_events} server event(s), "
+            f"{x.records} record(s), {x.sensitive_items} withheld value(s) of session(s) "
+            + ", ".join(i or "(no session id)" for i in x.session_ids))
+
+
+def _scope_fits(s, cwd: Optional[str]) -> bool:
+    """A call or event recorded under ``cwd`` can belong to server row ``s``
+    (the scope rule of the per-server MCP log summaries)."""
+    from .mcplog import enc
+
+    if s.scope == "user" or s.scope.startswith("(") or s.source_path.endswith(".mcp.json") or not cwd:
+        return True
+    return cwd == s.scope or enc(cwd) == enc(s.scope)
+
+
+def selected_use(case, s) -> dict[str, int]:
+    """Under a session filter: the server's calls in the selected sessions
+    (transcript tool_use names, MCP-log calls) and the connection attempts in
+    their kept MCP-log files."""
+    from .mcplog import enc, hc
+
+    name_hc, name_enc = hc(s.name), enc(s.name)
+    conns = [e for e in case.server_events
+             if e.event == "connect" and e.server_dir == name_enc and _scope_fits(s, e.cwd)]
+    return {
+        "transcript_calls": sum(1 for c in case.tool_calls
+                                if c.is_mcp and c.mcp_server == name_hc and _scope_fits(s, c.cwd)),
+        "log_calls": sum(1 for lc in case.log_calls if lc.server_dir == name_enc and _scope_fits(s, lc.cwd)),
+        "connects": len(conns),
+        "connected": sum(1 for e in conns if e.fields.get("outcome") == "connected"),
+    }
+
+
+def _selected_use_text(u: dict[str, int]) -> str:
+    parts = []
+    if u["transcript_calls"] or u["log_calls"]:
+        parts.append(f"called: {u['transcript_calls']} transcript, {u['log_calls']} MCP-log call(s)")
+    if u["connects"]:
+        parts.append(f"connects {u['connects']} ({u['connected']} connected)")
+    return "; ".join(parts) or "-"
+
+
+def servers_to_jsonable(servers, redact: bool, case=None) -> list[dict]:
     """Servers need env and header value redaction even though their key
     names never match the credential-key regex used by scrub() -- env and
-    headers are their own --redact category."""
+    headers are their own --redact category. Under a session filter each
+    server also carries "selected_sessions" (see selected_use)."""
     out = []
     for s in servers:
         d = s.model_dump(mode="json")
+        if case is not None and case.filter is not None:
+            d["selected_sessions"] = selected_use(case, s)
         d["env"] = redact_env(s.env, redact)
         d["headers"] = redact_env(s.headers, redact)
         d["url"] = redact_url(s.url, redact)
@@ -505,7 +623,7 @@ def _transport_text(s) -> str:
 _SERVERS_WIDE_MIN = 140
 
 
-def render_servers(console: Console, servers, redact: bool) -> None:
+def render_servers(console: Console, servers, redact: bool, case=None) -> None:
     table = Table(title="MCP Servers", show_lines=True, expand=True)
     table.add_column("Server", overflow="fold", ratio=1)
     table.add_column("Scope", overflow="fold", ratio=2)
@@ -518,6 +636,9 @@ def render_servers(console: Console, servers, redact: bool) -> None:
         table.add_column("OAuth config", overflow="fold", ratio=2)
     table.add_column("Debug (--debug file)", overflow="fold", ratio=2)
     table.add_column("MCP log", overflow="fold", ratio=4)
+    flt = case.filter if case is not None else None
+    if flt is not None:
+        table.add_column("Selected session(s)", overflow="fold", ratio=2)
     cards = []
     for s in servers:
         cmd_or_url = _command_or_url(s, redact)
@@ -536,12 +657,19 @@ def render_servers(console: Console, servers, redact: bool) -> None:
                 ("Command / URL", cmd_or_url or "-"), ("Env", env_str), ("Headers", _headers_text(s, redact)),
                 *([("OAuth config", _oauth_text(s, redact))] if oauth else []),
                 ("Debug (--debug file)", dbg), ("MCP log", _log_summary_cell(s.log_info))]
+        if flt is not None:
+            card.append(("Selected session(s)", _selected_use_text(selected_use(case, s))))
         cards.append(card)
         table.add_row(*(_cell(v) for _, v in card))
     if console.width >= _SERVERS_WIDE_MIN:
         console.print(table)
     else:
         _cards(console, "MCP Servers", cards)
+    if flt is not None:
+        _say(console, filter_summary(flt), "dim")
+        _say(console, "session filter: " + FILTER_NOTES["servers"][1].replace("selected_sessions gives",
+                                                                                "the Selected session(s) column gives"),
+             "dim")
 
 
 def render_tools(console: Console, tools) -> None:
@@ -602,6 +730,61 @@ def render_sessions(console: Console, sessions) -> None:
                       f"subagents {s.subagent_count}"),
             )
     console.print(table)
+
+
+def _size_text(n: int) -> str:
+    size, unit = float(n), "B"
+    for larger in ("KiB", "MiB", "GiB"):
+        if size < 1024:
+            break
+        size, unit = size / 1024, larger
+    return f"{n} B" if unit == "B" else f"{size:.1f} {unit}"
+
+
+_QUICK_WIDE_MIN = 170
+
+
+def render_quick_sessions(console: Console, rows: list[dict], total: int, flt=None) -> None:
+    """`sessions --quick`: one row per transcript, newest last activity first."""
+    table = Table(title="Sessions (quick: first and last records, file size and companion folder names)")
+
+    def sid(r: dict) -> str:
+        name = PurePath(r["transcript_path"]).name
+        return r["session_id"] + (f"\nfile name {name}" if r["file_name_differs"] else "")
+
+    def count(v: Optional[int]) -> str:
+        return "-" if v is None else str(v)
+
+    if console.width >= _QUICK_WIDE_MIN:
+        _id_column(table, "Session", 36)
+        _col(table, "Project folder")
+        _col(table, "cwd")
+        _ts_column(table, "First")
+        _ts_column(table, "Last")
+        _col(table, "Size", justify="right")
+        _col(table, "Sub-agents", justify="right")
+        _col(table, "Spilled", justify="right")
+        for r in rows:
+            table.add_row(_cell(sid(r)), _cell(r["project_dir"]), _cell(r["cwd"] or "-"),
+                          _cell(r["first_timestamp"] or "-"), _cell(r["last_timestamp"] or "-"),
+                          _size_text(r["size_bytes"]), count(r["subagent_sidecars"]), count(r["spilled_results"]))
+    else:
+        table.pad_edge = False
+        _col(table, "Session / project folder / cwd")
+        table.add_column("First / last", no_wrap=True, min_width=24)
+        table.add_column("Size, sub-agents, spilled", no_wrap=True)
+        for r in rows:
+            table.add_row(_cell(f"{sid(r)}\n{r['project_dir']}\n{r['cwd'] or '-'}"),
+                          _cell(f"{r['first_timestamp'] or '-'}\n{r['last_timestamp'] or '-'}"),
+                          _cell(f"{_size_text(r['size_bytes'])}\nsub-agents {count(r['subagent_sidecars'])}\n"
+                                f"spilled {count(r['spilled_results'])}"))
+    console.print(table)
+    shown = f"{len(rows)} of {total}" if len(rows) != total else str(total)
+    _say(console, f"{shown} transcript(s); first/last: timestamps of the first and last records that carry one "
+                  "(at most 8 MiB read from each end, lines over 1 MiB skipped); sub-agents: agent-*.meta.json in "
+                  "<session>/subagents/; spilled: files in <session>/tool-results/", "dim")
+    if flt is not None:
+        _say(console, filter_summary(flt), "dim")
 
 
 def _depth_prefix(depth: int) -> str:
@@ -826,7 +1009,10 @@ def log_counts(case) -> dict[str, int]:
         "transcript_mcp_calls_ambiguous": sum(1 for c in mcp_calls if c.log and c.log.status == "ambiguous"),
         "sensitive_items_withheld": 0 if case.sensitive_values_shown else (
             sum(f.sensitive_item_count for f in case.mcp_log_files)
-            + sum(f.sensitive_item_count for f in case.debug_files)),
+            + sum(f.sensitive_item_count for f in case.debug_files)) if case.filter is None else (
+            # under a session filter: the values in the records listed (see logevidence)
+            sum(len(r.sensitive) for f in case.mcp_log_files for r in f.entries)
+            + sum(len(x.sensitive) for f in case.debug_files for x in f.mcp_entries)),
     }
 
 
@@ -855,6 +1041,9 @@ def render_info(console: Console, case) -> None:
     table.add_row("Target root", _cell(case.target_root))
     table.add_row("HOME on the examined host", _cell(_home_text(case)))
     table.add_row("Project paths", _projects_text(case))
+    if case.filter is not None:
+        for label, text in filter_lines(case.filter):
+            table.add_row(label, _cell(text))
     table.add_row("Servers", str(len(case.servers)))
     table.add_row("Tools observed", str(len(case.tools)))
     table.add_row("Sessions", str(len(case.sessions)))
@@ -889,7 +1078,10 @@ def render_info(console: Console, case) -> None:
         table.add_row("Debug vs MCP log", f"matched {cc.matched} (identical {cc.identical}, redaction-only "
                       f"{cc.redaction_only}, error-object {cc.error_object}, differs {cc.differs}); "
                       f"MCP-log only {cc.mcp_log_only}; debug only {cc.debug_only}")
-    table.add_row("Sensitive values", "shown (--show-sensitive)" if case.sensitive_values_shown
+    shown_text = "shown (--show-sensitive)"
+    if case.filter is not None:
+        shown_text += "; values of other sessions stay withheld"
+    table.add_row("Sensitive values", shown_text if case.sensitive_values_shown
                   else f"withheld: {n['sensitive_items_withheld']} item(s) (see `mcpeek logs`)")
     console.print(table)
     if case.warnings:
@@ -1043,6 +1235,11 @@ def render_logs(console: Console, case, records: bool, file_filter: Optional[str
         console.print(t)
     else:
         _cards(console, "Per-server MCP log files", rows)
+    if case.filter is not None:
+        _say(console, filter_summary(case.filter), "dim")
+        for x in case.filter.filtered_out_by_file:
+            if _file_matches(x.path, file_filter):
+                _say(console, "  " + left_out_text(x, root), "dim")
 
     if case.debug_files or case.debug_latest_links:
         rows = []
@@ -1278,6 +1475,14 @@ def render_report_markdown(case, redact: bool, esc=_md) -> str:
     lines.append(f"- Transcript MCP calls without log record: {n['transcript_mcp_calls_no_log_record']}")
     lines.append("- Sensitive log values: " + ("shown" if case.sensitive_values_shown
                                               else f"withheld ({n['sensitive_items_withheld']} item(s))") + "\n")
+    if case.filter is not None:
+        lines.append("## Session filter\n")
+        for label, text in filter_lines(case.filter):
+            lines.append(f"- {label}: {esc(text)}")
+        for x in case.filter.filtered_out_by_file:
+            lines.append(f"- {esc(left_out_text(x, case.target_root))}")
+        lines.append("- Configured servers, OAuth clients and grants are listed in full; servers not in the current "
+                     "configuration come from the log files shown.\n")
 
     lines.append("## Servers\n")
     oauth = any(s.oauth is not None for s in case.servers)

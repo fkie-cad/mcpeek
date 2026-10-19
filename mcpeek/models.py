@@ -285,6 +285,48 @@ class PathAlias(BaseModel):
     looked_up_as: str
 
 
+class FilteredFile(BaseModel):
+    """Calls and events of other sessions in one kept MCP-log or --debug file,
+    left out of the views under a session filter."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str
+    log_calls: int = 0
+    server_events: int = 0
+    records: int = 0  # MCP-log records or --debug entries not listed by `logs`
+    sensitive_items: int = 0  # withheld values of other sessions' records taken out of the rows kept
+    session_ids: list[str] = Field(default_factory=list)  # the other session ids ("" for calls without one)
+    pairing_only: bool = False  # read only to pair --debug mirror lines as an unfiltered run does; not shown
+
+
+class SessionFilter(BaseModel):
+    """The active --session / --project filter and what it left out."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    session_values: list[str] = Field(default_factory=list)  # --session values as given
+    project_values: list[str] = Field(default_factory=list)  # --project values as given
+    session_ids: list[str] = Field(default_factory=list)  # the selected session ids
+    project_dirs: list[str] = Field(default_factory=list)  # project folders of the selected transcripts
+    transcript_files_total: int = 0  # transcript files found (counted by name)
+    transcript_files_selected: int = 0
+    transcript_paths: list[str] = Field(default_factory=list)
+    # None for `sessions --quick`, which reads no log
+    mcp_log_files_total: Optional[int] = None
+    mcp_log_files_kept: Optional[int] = None  # shown: a selected session appears in them
+    mcp_log_files_pairing_only: Optional[int] = None
+    debug_files_total: Optional[int] = None
+    debug_files_kept: Optional[int] = None  # shown: named after, or paired with records of, a selected session
+    debug_files_pairing_only: Optional[int] = None
+    log_calls_filtered_out: Optional[int] = None
+    server_events_filtered_out: Optional[int] = None
+    records_filtered_out: Optional[int] = None
+    sensitive_items_filtered_out: Optional[int] = None
+    filtered_out_by_file: list[FilteredFile] = Field(default_factory=list)
+    notes: list[str] = Field(default_factory=list)
+
+
 class Case(BaseModel):
     """The top-level parsed target: everything MCPeek recovered from one home-like root."""
 
@@ -313,6 +355,9 @@ class Case(BaseModel):
     skipped_symlinks: list[SkippedSymlink] = Field(default_factory=list)
     path_aliases: list[PathAlias] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
+    # set under --session / --project; added to JSON output as "filter" by the
+    # renderer (excluded here, so that unfiltered output is unchanged)
+    filter: Optional[SessionFilter] = Field(default=None, exclude=True)
 
 
 # ---------------------------------------------------------------------------

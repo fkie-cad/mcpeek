@@ -1053,6 +1053,7 @@ def build_case(discovered: DiscoveredTarget, show_sensitive: bool = False):
     sessions: list[Session] = []
     all_tool_calls: list[ToolCall] = []
     all_subagents: list[Subagent] = []
+    flt = discovered.filter
     for sf in discovered.sessions:
         try:
             session, calls, subs = parse_session(sf, discovered.target_root, warnings)
@@ -1069,6 +1070,14 @@ def build_case(discovered: DiscoveredTarget, show_sensitive: bool = False):
         if len(paths) > 1:
             warnings.append(f"session id {sid!r} is recorded in {len(paths)} transcripts ({', '.join(paths)}); "
                             "each is listed as its own session row and their calls share the id")
+    if flt is not None:
+        # the selected sessions are the ids the parsed transcripts are listed
+        # under; their MCP-log and --debug files follow from them
+        from .loader import plan_log_files
+
+        flt.session_ids = sorted(by_id)
+        flt.known_session_ids |= set(by_id)
+        plan_log_files(discovered, set(by_id))
 
     policy = SensitivePolicy(show=show_sensitive)
     evidence = build_log_evidence(discovered, servers, sessions, all_tool_calls, policy)
@@ -1167,7 +1176,53 @@ def build_case(discovered: DiscoveredTarget, show_sensitive: bool = False):
         path_aliases=[PathAlias(path=str(x.path), target=x.target, same_as=str(x.same_as), looked_up_as=x.looked_up_as)
                       for x in discovered.aliases],
         warnings=warnings,
+        filter=session_filter(flt, evidence.filtered_out) if flt is not None else None,
     )
+
+
+def session_filter(flt, filtered_out=None, quick: bool = False):
+    """The filter object of a case (or of `sessions --quick`, which reads no log)."""
+    from .models import SessionFilter
+
+    out = SessionFilter(
+        session_values=list(flt.sessions), project_values=list(flt.projects), session_ids=list(flt.session_ids),
+        project_dirs=list(flt.project_dirs), transcript_files_total=flt.transcript_files,
+        transcript_files_selected=len(flt.transcript_paths), transcript_paths=[str(p) for p in flt.transcript_paths],
+    )
+    matching = ("--session matches the session id of a transcript's first records or its file name; every "
+                "transcript listed under the same session id is selected; transcripts are counted by file name")
+    if quick:
+        out.notes.append(matching + "; session_ids are the ids the selected transcripts are listed under, from "
+                         "their first and last records")
+        return out
+    out.mcp_log_files_total, out.mcp_log_files_kept = flt.mcp_log_files_total, flt.mcp_log_files_kept
+    out.mcp_log_files_pairing_only = flt.mcp_log_files_pairing_only
+    out.debug_files_total, out.debug_files_kept = flt.debug_files_total, flt.debug_files_kept
+    out.debug_files_pairing_only = flt.debug_files_pairing_only
+    out.filtered_out_by_file = list(filtered_out or [])
+    out.log_calls_filtered_out = sum(f.log_calls for f in out.filtered_out_by_file)
+    out.server_events_filtered_out = sum(f.server_events for f in out.filtered_out_by_file)
+    out.records_filtered_out = sum(f.records for f in out.filtered_out_by_file)
+    out.sensitive_items_filtered_out = sum(f.sensitive_items for f in out.filtered_out_by_file)
+    out.notes += [
+        matching + "; only the selected transcripts are parsed (of the others the first records are read)",
+        "MCP-log files shown: those in which a selected session appears (the leading record that --continue "
+        "writes counts with the session that follows it); in them, calls of other sessions and their "
+        "session-bound events are left out and counted per file, server process events (connect, shutdown, "
+        "session switch, ...) are kept",
+        "--debug files shown: those named after a selected session or paired with records of one",
+        "files marked pairing_only are read only so that --debug mirror lines pair with MCP-log records as in an "
+        "unfiltered run; none of their rows or records is shown, only their path and counts here",
+        "logs: only the records of the selected sessions and records without a session id (MCP logs), the "
+        "entries of the selected sessions (debug files), and the withheld values in them; the cross-check counts "
+        "the records of the selected sessions in scope and the mirror lines paired with them",
+        "values of other sessions' records stay withheld, also with --show-sensitive: a row kept from such "
+        "records (a server process event) shows them as withheld in its text and carries no item of them "
+        "(sensitive_items counts them per file)",
+        "configured servers, OAuth clients and grants are listed in full; servers not in the current "
+        "configuration and the per-server MCP log summaries come from the files shown",
+    ]
+    return out
 
 
 def _add_log_tool_counts(tools: list[Tool], log_calls, tool_calls: list[ToolCall]) -> None:
